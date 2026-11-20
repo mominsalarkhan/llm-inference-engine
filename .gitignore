@@ -6,3 +6,4 @@ __pycache__/
 *.safetensors
 compile_commands.json
 .DS_Store
+.vscode/
