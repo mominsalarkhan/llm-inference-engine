@@ -12,8 +12,11 @@ endif()
 # CPU build works everywhere (Mac included). Turn this on only on the PC.
 option(ENGINE_CUDA "Build the CUDA backend" OFF)
 
-add_executable(engine src/main.cpp src/safetensors.cpp)
+add_executable(engine src/main.cpp src/safetensors.cpp src/ops.cpp src/model.cpp)
 target_compile_options(engine PRIVATE -Wall -Wextra)
+
+find_package(Threads REQUIRED)
+target_link_libraries(engine PRIVATE Threads::Threads)
 
 if(ENGINE_CUDA)
   enable_language(CUDA)

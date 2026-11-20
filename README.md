@@ -41,6 +41,20 @@ cmake -B build -DENGINE_CUDA=ON && cmake --build build
 
 Run `sudo apt install openssh-server` in WSL and start the ssh service. Then use VS Code Remote-SSH from the Mac to edit and build on the PC directly. Git keeps both machines in sync.
 
+## Checking the engine
+
+Point `models/tinyllama` at the HF snapshot folder (it holds `config.json` and `model.safetensors`):
+
+```
+ln -s "$(dirname "$(readlink models/tinyllama.safetensors)")" models/tinyllama
+```
+
+Then run the full forward pass against golden, layer by layer, plus 20 tokens of greedy generation:
+
+```
+./build/engine check models/tinyllama golden capital
+```
+
 ## Golden data
 
 `golden/<prompt>.safetensors` holds, per prompt:
