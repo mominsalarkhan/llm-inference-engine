@@ -1,6 +1,19 @@
-# engine
+# LLM Inference Engine
 
 LLM inference engine in C++ and CUDA, built from scratch. Target: TinyLlama 1.1B, then bigger models quantized, on an RTX 3060 (12GB).
+
+## Status
+
+- [x] safetensors loader (mmap, BF16/F16/F32)
+- [x] CPU forward pass with KV cache, grouped-query attention, RoPE, SwiGLU
+- [x] Matches Hugging Face on all 22 layers of TinyLlama 1.1B (max relative error ~1e-5), identical greedy output
+- [ ] CUDA backend
+- [ ] Custom decode kernels (GEMV, fused attention)
+- [ ] INT8 / INT4 weight quantization
+- [ ] CUDA graphs
+- [ ] Paged KV cache and continuous batching
+
+CPU baseline (Apple Silicon, naive scalar matvec): 4.3 tok/s.
 
 ## Setup
 
