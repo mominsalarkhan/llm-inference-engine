@@ -13,13 +13,16 @@
 //   Q4:   4 bits per weight + fp16 (scale, min) per 64 weights (~0.56 bytes per weight),
 //         output layer kept at Q8
 //   Q4_MSE: same format, but each group's (scale, min) is searched to minimize squared error
-enum class Quant { BF16, Q8, Q4, Q4_MSE };
+//   Q4_AWQ: same search, with each weight's error weighted by its input channel's mean x^2
+//           from a calibration run (see `engine calibrate`)
+enum class Quant { BF16, Q8, Q4, Q4_MSE, Q4_AWQ };
 
 // Same interface as Model, but weights, KV cache and all the math live on the GPU.
 // This header stays plain C++ so main.cpp doesn't need nvcc.
 class CudaModel {
 public:
-    CudaModel(const std::string& model_dir, int max_seq, Quant quant = Quant::BF16);
+    CudaModel(const std::string& model_dir, int max_seq, Quant quant = Quant::BF16,
+              const std::string& calib_path = "");
     ~CudaModel();
 
     const Config& config() const { return cfg_; }

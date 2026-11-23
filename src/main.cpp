@@ -7,6 +7,7 @@
 #include <exception>
 #include <fstream>
 #include <map>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -235,17 +236,19 @@ int with_model(const std::string& backend, const std::string& model_dir, int max
     else if (backend == "cuda-q8") q = Quant::Q8;
     else if (backend == "cuda-q4") q = Quant::Q4;
     else if (backend == "cuda-q4mse") q = Quant::Q4_MSE;
+    else if (backend == "cuda-q4awq") q = Quant::Q4_AWQ;
     else known = false;
     if (known) {
         auto t0 = std::chrono::steady_clock::now();
-        CudaModel model(model_dir, max_seq, q);
+        const char* calib = std::getenv("ENGINE_CALIB");
+        CudaModel model(model_dir, max_seq, q, calib ? calib : "");
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::printf("backend: %s (%s), load %.1fs, weights %.2f GB on GPU\n", backend.c_str(),
                     model.device_name().c_str(), s, model.weight_bytes() / 1e9);
         return fn(model);
     }
 #endif
-    std::printf("unknown or unavailable backend: %s (try cpu, cuda, cuda-q8, cuda-q4, cuda-q4mse)\n", backend.c_str());
+    std::printf("unknown or unavailable backend: %s (try cpu, cuda, cuda-q8, cuda-q4, cuda-q4mse, cuda-q4awq)\n", backend.c_str());
     return 1;
 }
 
@@ -282,6 +285,15 @@ int bench(const std::string& model_dir, const std::string& backend, int n) {
     });
 }
 
+std::vector<int32_t> read_tokens(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("can't open " + path);
+    std::vector<int32_t> toks;
+    int32_t t;
+    while (f.read(reinterpret_cast<char*>(&t), 4)) toks.push_back(t);
+    return toks;
+}
+
 double meta_number(const std::string& meta_path, const std::string& key) {
     std::ifstream f(meta_path);
     std::stringstream ss;
@@ -296,11 +308,7 @@ double meta_number(const std::string& meta_path, const std::string& key) {
 // Perplexity over golden/ppl_tokens.bin: how surprised the model is by real text.
 // exp(mean negative log-likelihood of each next token). Lower is better.
 int ppl(const std::string& model_dir, const std::string& golden_dir, const std::string& backend) {
-    std::ifstream f(golden_dir + "/ppl_tokens.bin", std::ios::binary);
-    if (!f) throw std::runtime_error("no " + golden_dir + "/ppl_tokens.bin, rerun tools/golden.py");
-    std::vector<int32_t> toks;
-    int32_t t;
-    while (f.read(reinterpret_cast<char*>(&t), 4)) toks.push_back(t);
+    std::vector<int32_t> toks = read_tokens(golden_dir + "/ppl_tokens.bin");
     if (toks.size() < 2) throw std::runtime_error("ppl_tokens.bin is too short");
 
     double hf = meta_number(golden_dir + "/meta.json", "ppl_hf");
@@ -325,9 +333,108 @@ int ppl(const std::string& model_dir, const std::string& golden_dir, const std::
     });
 }
 
+struct Sampling {
+    float temperature = 0.0f; // 0 = greedy
+    float top_p = 1.0f;
+    uint64_t seed = 0;
+};
+
+// Temperature + nucleus (top-p) sampling: soften the distribution, keep the smallest set of
+// tokens whose probabilities add up to top_p, pick one of those at random by weight.
+int sample(const std::vector<float>& logits, const Sampling& sp, std::mt19937_64& rng) {
+    if (sp.temperature <= 0.0f) return argmax(logits);
+
+    float mx = *std::max_element(logits.begin(), logits.end());
+    std::vector<std::pair<float, int>> probs(logits.size());
+    double sum = 0.0;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        float p = std::exp((logits[i] - mx) / sp.temperature);
+        probs[i] = {p, int(i)};
+        sum += p;
+    }
+    std::sort(probs.begin(), probs.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    double keep = 0.0;
+    size_t n = 0;
+    while (n < probs.size() && keep < sp.top_p * sum) keep += probs[n++].first;
+
+    std::uniform_real_distribution<double> u(0.0, keep);
+    double r = u(rng);
+    for (size_t i = 0; i < n; ++i) {
+        r -= probs[i].first;
+        if (r <= 0.0) return probs[i].second;
+    }
+    return probs[n - 1].second;
+}
+
+void write_safetensors(const std::string& path, const std::map<std::string, std::vector<float>>& tensors) {
+    std::string header = "{";
+    size_t offset = 0;
+    for (const auto& [name, v] : tensors) {
+        if (header.size() > 1) header += ",";
+        header += "\"" + name + "\":{\"dtype\":\"F32\",\"shape\":[" + std::to_string(v.size()) +
+                  "],\"data_offsets\":[" + std::to_string(offset) + "," +
+                  std::to_string(offset + v.size() * 4) + "]}";
+        offset += v.size() * 4;
+    }
+    header += "}";
+    while (header.size() % 8) header += ' ';
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("can't write " + path);
+    uint64_t n = header.size();
+    f.write(reinterpret_cast<const char*>(&n), 8);
+    f.write(header.data(), std::streamsize(header.size()));
+    for (const auto& kv : tensors)
+        f.write(reinterpret_cast<const char*>(kv.second.data()), std::streamsize(kv.second.size() * 4));
+}
+
+// Run calibration text through the model and record, for the input of every weight matrix,
+// the mean of x^2 per channel. Q4_AWQ uses it to know which weights matter most.
+int calibrate(const std::string& model_dir, const std::string& backend, const std::string& tokens_path,
+              const std::string& out_path) {
+    std::vector<int32_t> toks = read_tokens(tokens_path);
+    if (toks.empty()) throw std::runtime_error("no calibration tokens");
+
+    return with_model(backend, model_dir, int(toks.size()) + 1, [&](auto& model) {
+        // checkpoint name suffix -> which matrix it feeds
+        const std::pair<std::string, std::string> feeds[] = {
+            {".attn_norm", "qkv_in"}, {".attn", "o_in"}, {".mlp_norm", "gu_in"}, {".mlp_act", "down_in"}};
+
+        std::map<std::string, std::vector<double>> acc;
+        Tap tap = [&](const std::string& name, const float* data, int n) {
+            for (const auto& [suffix, key] : feeds) {
+                if (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    std::string out = name.substr(0, name.size() - suffix.size()) + "." + key;
+                    auto& v = acc[out];
+                    if (v.empty()) v.assign(size_t(n), 0.0);
+                    for (int i = 0; i < n; ++i) v[size_t(i)] += double(data[i]) * data[i];
+                }
+            }
+        };
+
+        auto t0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < toks.size(); ++i) model.forward(toks[i], int(i), tap);
+        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+        if (acc.empty()) throw std::runtime_error("no matrix inputs were tapped; use a cuda backend");
+        std::map<std::string, std::vector<float>> out;
+        for (const auto& [name, v] : acc) {
+            std::vector<float> mean(v.size());
+            for (size_t i = 0; i < v.size(); ++i) mean[i] = float(v[i] / double(toks.size()));
+            out[name] = std::move(mean);
+        }
+        write_safetensors(out_path, out);
+        std::printf("calibrated on %zu tokens in %.1fs: %zu stat vectors -> %s\n", toks.size(), secs, out.size(),
+                    out_path.c_str());
+        return 0;
+    });
+}
+
 // Greedy generation from given prompt token ids. Prints the new ids on one line so a
 // script (tools/run.py) can decode them, then a timing line.
-int generate(const std::string& model_dir, const std::string& backend, int n, const std::vector<int>& prompt) {
+int generate(const std::string& model_dir, const std::string& backend, int n, const std::vector<int>& prompt,
+             const Sampling& sp) {
     if (prompt.empty()) throw std::runtime_error("generate needs at least one prompt token id");
     return with_model(backend, model_dir, int(prompt.size()) + n + 1, [&](auto& model) {
         auto t0 = std::chrono::steady_clock::now();
@@ -335,13 +442,14 @@ int generate(const std::string& model_dir, const std::string& backend, int n, co
         for (size_t i = 0; i < prompt.size(); ++i) logits = model.forward(prompt[i], int(i));
         double prefill = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
+        std::mt19937_64 rng(sp.seed ? sp.seed : std::random_device{}());
         std::vector<int> out;
-        int tok = argmax(logits);
+        int tok = sample(logits, sp, rng);
         t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < n; ++i) {
             out.push_back(tok);
             if (tok == 2 || i + 1 == n) break; // 2 = end of sequence for Llama-family tokenizers
-            tok = argmax(model.forward(tok, int(prompt.size()) + i));
+            tok = sample(model.forward(tok, int(prompt.size()) + i), sp, rng);
         }
         double gen = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
@@ -360,8 +468,9 @@ void usage() {
     std::printf("  engine check <model_dir> <golden_dir> <prompt> [backend]\n");
     std::printf("  engine bench <model_dir> [backend] [tokens]\n");
     std::printf("  engine ppl <model_dir> <golden_dir> [backend]\n");
-    std::printf("  engine generate <model_dir> <backend> <n_tokens> <prompt ids...>\n");
-    std::printf("backends: cpu, cuda, cuda-q8, cuda-q4, cuda-q4mse\n");
+    std::printf("  engine generate <model_dir> <backend> <n_tokens> [--temp T] [--top-p P] [--seed S] <prompt ids...>\n");
+    std::printf("  engine calibrate <model_dir> <backend> <tokens.bin> <out.safetensors>\n");
+    std::printf("backends: cpu, cuda, cuda-q8, cuda-q4, cuda-q4mse, cuda-q4awq (needs ENGINE_CALIB)\n");
 }
 
 } // namespace
@@ -382,10 +491,18 @@ int main(int argc, char** argv) {
             return bench(argv[2], argc >= 4 ? argv[3] : "cpu", argc == 5 ? std::atoi(argv[4]) : 128);
         if (cmd == "ppl" && (argc == 4 || argc == 5)) return ppl(argv[2], argv[3], argc == 5 ? argv[4] : "cpu");
         if (cmd == "generate" && argc >= 6) {
+            Sampling sp;
             std::vector<int> prompt;
-            for (int i = 5; i < argc; ++i) prompt.push_back(std::atoi(argv[i]));
-            return generate(argv[2], argv[3], std::atoi(argv[4]), prompt);
+            for (int i = 5; i < argc; ++i) {
+                std::string a = argv[i];
+                if (a == "--temp" && i + 1 < argc) sp.temperature = std::stof(argv[++i]);
+                else if (a == "--top-p" && i + 1 < argc) sp.top_p = std::stof(argv[++i]);
+                else if (a == "--seed" && i + 1 < argc) sp.seed = std::stoull(argv[++i]);
+                else prompt.push_back(std::atoi(argv[i]));
+            }
+            return generate(argv[2], argv[3], std::atoi(argv[4]), prompt, sp);
         }
+        if (cmd == "calibrate" && argc == 6) return calibrate(argv[2], argv[3], argv[4], argv[5]);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

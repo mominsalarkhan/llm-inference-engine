@@ -37,6 +37,32 @@ Years later, when people asked Maria what she was most proud of, she did not tal
 the records she kept, because they showed exactly what had happened, what had worked, and what had failed. Good notes,
 she said, are how you stop making the same mistake twice."""
 
+# Separate text for calibrating activation-aware quantization. Deliberately different from
+# PPL_TEXT: tuning on the passage you then score on would inflate the result.
+CALIB_TEXT = """Every spring the river that runs past the old mill rises with snowmelt from the mountains. For most of the
+year it is quiet and shallow, but for a few weeks it turns brown and fast, carrying branches, mud, and the occasional
+lost boot downstream toward the lake. The people who live along its banks have learned to move their gardens back
+from the water and to keep sandbags stacked by the door.
+
+The mill itself stopped grinding grain decades ago. A group of volunteers bought the building, repaired the roof,
+and turned the ground floor into a workshop where children can learn carpentry, basic electronics, and how to fix
+bicycles. On weekends the place is crowded. Someone is always sanding a birdhouse, someone else is soldering a circuit
+board, and a retired teacher walks between the tables asking questions instead of giving answers.
+
+Funding is a constant worry. The group applies for small grants, sells vegetables from a shared garden, and holds a
+festival every autumn with music, food stalls, and a race where teams build rafts from scrap and try to float them
+across the mill pond. Most of the rafts sink within a few minutes, which is exactly why people come to watch.
+
+Last year a storm knocked out power to the whole valley for four days. The workshop had a small generator and a
+supply of batteries, so it became the place where families charged phones, warmed food, and checked on neighbors.
+Nobody had planned for that, but the habits the volunteers had built, sharing tools, keeping an inventory, and
+writing down who needed what, made it easy to organize. When the lights came back on, several families who had never
+visited before signed up their children for classes.
+
+The river will rise again next spring, as it always does. The volunteers are already planning a new floor drain, a
+second generator, and a better system for lending tools, because they have learned that being ready for an ordinary
+season is the best way to be ready for an unusual one."""
+
 PROMPTS = {
     "capital": "The capital of France is",
     "count": "1, 2, 3, 4, 5,",

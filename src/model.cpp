@@ -161,6 +161,7 @@ const std::vector<float>& Model::forward(int token, int pos, const Tap& tap) {
             }
         }
 
+        emit(p + "attn", attn_.data(), c.n_heads * hd);
         matvec(xb, *L.wo, attn_.data());
         emit(p + "attn_out", xb, dim);
         for (int i = 0; i < dim; ++i) x[i] += xb[i];
@@ -172,6 +173,7 @@ const std::vector<float>& Model::forward(int token, int pos, const Tap& tap) {
         matvec(h1_.data(), *L.gate, xb);
         matvec(h2_.data(), *L.up, xb);
         for (int i = 0; i < c.hidden_dim; ++i) h1_[i] = silu(h1_[i]) * h2_[i];
+        emit(p + "mlp_act", h1_.data(), c.hidden_dim);
         matvec(xb, *L.down, h1_.data());
         emit(p + "mlp_out", xb, dim);
         for (int i = 0; i < dim; ++i) x[i] += xb[i];

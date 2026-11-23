@@ -18,13 +18,18 @@ def main():
     p.add_argument("prompt")
     p.add_argument("--backend", default="cuda-q4")
     p.add_argument("--tokens", type=int, default=100)
+    p.add_argument("--temp", type=float, default=0.7, help="0 = greedy (always the top word)")
+    p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--seed", type=int, default=0, help="0 = random each run")
     p.add_argument("--engine", default="build/engine")
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model_dir)
     ids = tok(args.prompt).input_ids  # starts with the BOS token
 
-    cmd = [args.engine, "generate", args.model_dir, args.backend, str(args.tokens)] + [str(i) for i in ids]
+    cmd = [args.engine, "generate", args.model_dir, args.backend, str(args.tokens),
+           "--temp", str(args.temp), "--top-p", str(args.top_p), "--seed", str(args.seed)]
+    cmd += [str(i) for i in ids]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         print(res.stdout, res.stderr, file=sys.stderr)

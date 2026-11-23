@@ -407,8 +407,9 @@ struct CudaModel::Impl {
     }
 
     // Stack one or more BF16 matrices by rows into a single GPU matrix, quantizing on the way if asked.
+    // importance: optional per-column weights (length cols), only used by Q4_AWQ.
     Mat upload(const WeightFiles& st, const std::vector<std::string>& names, const std::vector<int64_t>& rows,
-               int64_t cols, Quant fmt) {
+               int64_t cols, Quant fmt, const float* importance = nullptr) {
         Mat m;
         for (int64_t r : rows) m.rows += int(r);
         m.cols = int(cols);
@@ -499,13 +500,30 @@ struct CudaModel::Impl {
         std::vector<uint8_t> hq(size_t(m.rows) * cols / 2);
         std::vector<__half2> hsm(size_t(m.rows) * groups);
 
-        bool search = fmt == Quant::Q4_MSE;
+        // Q4_MSE: search each group's range to minimize plain squared error (every weight equal).
+        // Q4_AWQ: same search, but each weight's error counts by how large its input channel
+        //         typically is (importance[col] = mean x^2 from calibration). Error on a weight
+        //         then approximates the error it causes in the output. Plain round-to-nearest is
+        //         always a candidate, so by this measure it can never do worse than Q4.
+        bool search = fmt == Quant::Q4_MSE || fmt == Quant::Q4_AWQ;
+        bool weighted = fmt == Quant::Q4_AWQ;
+        if (weighted && !importance) throw std::runtime_error(names[0] + ": Q4_AWQ needs calibration stats");
+
+        std::vector<float> imp(size_t(cols), 1.0f);
+        if (weighted) {
+            double mean = 0.0;
+            for (int64_t k = 0; k < cols; ++k) mean += importance[k];
+            mean /= double(cols);
+            // small floor so a channel that never fired in calibration still counts a little
+            for (int64_t k = 0; k < cols; ++k) imp[size_t(k)] = importance[k] + float(1e-4 * mean);
+        }
 
         for_each_row([&](int64_t r, const float* row) {
             int q[Q4_GROUP];
             int trial[Q4_GROUP];
             for (int g = 0; g < groups; ++g) {
                 const float* w = row + g * Q4_GROUP;
+                const float* a = imp.data() + g * Q4_GROUP;
                 float lo = w[0];
                 float hi = w[0];
                 for (int k = 1; k < Q4_GROUP; ++k) {
@@ -522,7 +540,7 @@ struct CudaModel::Impl {
                     float e = 0.0f;
                     for (int k = 0; k < Q4_GROUP; ++k) {
                         float d = qq[k] * sc + mn - w[k];
-                        e += d * d;
+                        e += a[k] * d * d;
                     }
                     return e;
                 };
@@ -532,9 +550,13 @@ struct CudaModel::Impl {
                 float mn = lo;
 
                 if (search) {
-                    // Try ranges shrunk by 0..16%, then refit scale and min by least squares on the
-                    // chosen levels (fit w ~ q*scale + min), reassign, refit once more. Keep the best.
                     float best = INFINITY;
+                    if (weighted) {
+                        assign(scale, mn, trial);
+                        best = sq_error(scale, mn, trial);
+                    }
+                    // Try ranges shrunk by 0..16%, then refit scale and min by (weighted) least squares
+                    // on the chosen levels (fit w ~ q*scale + min), reassign, refit once more.
                     for (int step = 0; step <= 8; ++step) {
                         float shrink = 0.02f * step;
                         float s_try = (hi - lo) * (1.0f - shrink) / 15.0f;
@@ -542,12 +564,13 @@ struct CudaModel::Impl {
                         assign(s_try, m_try, trial);
 
                         for (int iter = 0; iter < 2; ++iter) {
-                            float n = float(Q4_GROUP), sq = 0, sqq = 0, sw = 0, sqw = 0;
+                            float n = 0, sq = 0, sqq = 0, sw = 0, sqw = 0;
                             for (int k = 0; k < Q4_GROUP; ++k) {
-                                sq += trial[k];
-                                sqq += float(trial[k]) * trial[k];
-                                sw += w[k];
-                                sqw += trial[k] * w[k];
+                                n += a[k];
+                                sq += a[k] * trial[k];
+                                sqq += a[k] * float(trial[k]) * trial[k];
+                                sw += a[k] * w[k];
+                                sqw += a[k] * trial[k] * w[k];
                             }
                             float det = n * sqq - sq * sq;
                             if (det <= 0.0f) break;
@@ -599,11 +622,25 @@ struct CudaModel::Impl {
     }
 };
 
-CudaModel::CudaModel(const std::string& model_dir, int max_seq, Quant quant)
+CudaModel::CudaModel(const std::string& model_dir, int max_seq, Quant quant, const std::string& calib_path)
     : cfg_(load_config(model_dir + "/config.json")), max_seq_(max_seq), impl_(new Impl) {
     const Config& c = cfg_;
     Impl& m = *impl_;
     m.quant = quant;
+
+    // calibration stats (mean x^2 per input channel of each matrix), needed by Q4_AWQ
+    std::unique_ptr<SafeTensors> calib;
+    if (quant == Quant::Q4_AWQ) {
+        if (calib_path.empty()) throw std::runtime_error("cuda-q4awq needs calibration stats: set ENGINE_CALIB");
+        calib = std::make_unique<SafeTensors>(calib_path);
+    }
+    auto importance = [&](const std::string& key, int64_t n) -> std::vector<float> {
+        if (!calib) return {};
+        std::vector<float> v = to_f32(calib->get(key));
+        if (int64_t(v.size()) != n) throw std::runtime_error(key + ": calibration size mismatch");
+        return v;
+    };
+    auto ptr = [](const std::vector<float>& v) { return v.empty() ? nullptr : v.data(); };
 
     int q_dim = c.n_heads * c.head_dim;
     int kv_dim = c.n_kv_heads * c.head_dim;
@@ -614,7 +651,7 @@ CudaModel::CudaModel(const std::string& model_dir, int max_seq, Quant quant)
     m.embed = m.upload(st, {"model.embed_tokens.weight"}, {c.vocab}, c.dim, Quant::BF16).bf16;
     std::string head = st.has("lm_head.weight") ? "lm_head.weight" : "model.embed_tokens.weight";
     // the output layer picks the next word, so in 4-bit mode it stays 8-bit
-    m.lm_head = m.upload(st, {head}, {c.vocab}, c.dim, (quant == Quant::Q4 || quant == Quant::Q4_MSE) ? Quant::Q8 : quant);
+    m.lm_head = m.upload(st, {head}, {c.vocab}, c.dim, (quant == Quant::Q4 || quant == Quant::Q4_MSE || quant == Quant::Q4_AWQ) ? Quant::Q8 : quant);
     m.final_norm = m.upload_f32(st, "model.norm.weight");
 
     for (int i = 0; i < c.n_layers; ++i) {
@@ -622,14 +659,21 @@ CudaModel::CudaModel(const std::string& model_dir, int max_seq, Quant quant)
         Impl::Layer l;
         l.attn_norm = m.upload_f32(st, p + "input_layernorm.weight");
         l.mlp_norm = m.upload_f32(st, p + "post_attention_layernorm.weight");
+        // calibration keys match what `engine calibrate` writes: inputs of each matrix
+        std::string cp = "layer" + std::to_string(i) + ".";
+        std::vector<float> qkv_in = importance(cp + "qkv_in", c.dim);
+        std::vector<float> o_in = importance(cp + "o_in", q_dim);
+        std::vector<float> gu_in = importance(cp + "gu_in", c.dim);
+        std::vector<float> down_in = importance(cp + "down_in", c.hidden_dim);
+
         l.wqkv = m.upload(st,
                           {p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
                            p + "self_attn.v_proj.weight"},
-                          {q_dim, kv_dim, kv_dim}, c.dim, quant);
-        l.wo = m.upload(st, {p + "self_attn.o_proj.weight"}, {c.dim}, q_dim, quant);
+                          {q_dim, kv_dim, kv_dim}, c.dim, quant, ptr(qkv_in));
+        l.wo = m.upload(st, {p + "self_attn.o_proj.weight"}, {c.dim}, q_dim, quant, ptr(o_in));
         l.wgu = m.upload(st, {p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"},
-                         {c.hidden_dim, c.hidden_dim}, c.dim, quant);
-        l.down = m.upload(st, {p + "mlp.down_proj.weight"}, {c.dim}, c.hidden_dim, quant);
+                         {c.hidden_dim, c.hidden_dim}, c.dim, quant, ptr(gu_in));
+        l.down = m.upload(st, {p + "mlp.down_proj.weight"}, {c.dim}, c.hidden_dim, quant, ptr(down_in));
         m.layers.push_back(l);
     }
 
@@ -695,6 +739,7 @@ void CudaModel::enqueue(const Tap* tap) {
     const int T = 256;
     int dim = c.dim;
     int hd = c.head_dim;
+    int q_dim = c.n_heads * hd;
     int kv_dim = c.n_kv_heads * hd;
     int group = c.n_heads / c.n_kv_heads;
     float scale = 1.0f / std::sqrt(float(hd));
@@ -731,6 +776,7 @@ void CudaModel::enqueue(const Tap* tap) {
         attention_kernel<<<c.n_heads, 128, m.attn_smem, s>>>(m.attn, m.qkv, k_layer, v_layer, m.state, hd,
                                                              kv_dim, group, scale);
 
+        emit(p + "attn", m.attn, q_dim);
         matvec(m.xb, L.wo, m.attn);
         emit(p + "attn_out", m.xb, dim);
         add_kernel<<<blocks_for(dim, T), T, 0, s>>>(m.x, m.xb, dim);
@@ -740,6 +786,7 @@ void CudaModel::enqueue(const Tap* tap) {
 
         matvec(m.h, L.wgu, m.xb);
         silu_mul_kernel<<<blocks_for(c.hidden_dim, T), T, 0, s>>>(m.h, c.hidden_dim);
+        emit(p + "mlp_act", m.h, c.hidden_dim);
         matvec(m.xb, L.down, m.h);
         emit(p + "mlp_out", m.xb, dim);
         add_kernel<<<blocks_for(dim, T), T, 0, s>>>(m.x, m.xb, dim);
