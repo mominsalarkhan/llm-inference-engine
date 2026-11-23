@@ -12,14 +12,22 @@ endif()
 # CPU build works everywhere (Mac included). Turn this on only on the PC.
 option(ENGINE_CUDA "Build the CUDA backend" OFF)
 
+if(ENGINE_CUDA)
+  set(CMAKE_CUDA_ARCHITECTURES 86) # RTX 3060 / Ampere
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  find_package(CUDAToolkit REQUIRED)
+endif()
+
 add_executable(engine src/main.cpp src/safetensors.cpp src/ops.cpp src/model.cpp)
-target_compile_options(engine PRIVATE -Wall -Wextra)
+target_compile_options(engine PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
 
 find_package(Threads REQUIRED)
 target_link_libraries(engine PRIVATE Threads::Threads)
 
 if(ENGINE_CUDA)
-  enable_language(CUDA)
-  set(CMAKE_CUDA_ARCHITECTURES 86) # RTX 3060 / Ampere
+  target_sources(engine PRIVATE src/model_cuda.cu)
   target_compile_definitions(engine PRIVATE ENGINE_CUDA)
+  target_link_libraries(engine PRIVATE CUDA::cudart)
 endif()

@@ -15,6 +15,10 @@
 #include "model.h"
 #include "safetensors.h"
 
+#ifdef ENGINE_CUDA
+#include "model_cuda.h"
+#endif
+
 namespace {
 
 std::string shape_str(const std::vector<int64_t>& shape) {
@@ -127,17 +131,10 @@ Diff compare(const std::vector<float>& ours, const std::vector<float>& ref) {
 }
 
 // Full forward pass vs golden, checkpoint by checkpoint, then greedy generation.
-int check(const std::string& model_dir, const std::string& golden_dir, const std::string& prompt) {
+// Works for both Model (CPU) and CudaModel.
+template <typename M>
+int run_check(M& model, const SafeTensors& golden, const std::vector<int>& ids, const std::vector<int>& want_gen) {
     const float tol = 1e-3f;
-
-    SafeTensors golden(golden_dir + "/" + prompt + ".safetensors");
-    std::vector<int> want_gen = golden_greedy_ids(golden_dir + "/meta.json", prompt);
-
-    const Tensor& ids_t = golden.get("input_ids");
-    std::vector<int> ids(size_t(ids_t.numel()));
-    std::memcpy(ids.data(), ids_t.data, ids.size() * 4);
-
-    Model model(model_dir, int(ids.size() + want_gen.size()) + 1);
     const Config& c = model.config();
     std::printf("model: dim %d, %d layers, %d heads (%d kv), head_dim %d, vocab %d\n",
                 c.dim, c.n_layers, c.n_heads, c.n_kv_heads, c.head_dim, c.vocab);
@@ -215,11 +212,68 @@ int check(const std::string& model_dir, const std::string& golden_dir, const std
     return ok ? 0 : 1;
 }
 
+int check(const std::string& model_dir, const std::string& golden_dir, const std::string& prompt,
+          const std::string& backend) {
+    SafeTensors golden(golden_dir + "/" + prompt + ".safetensors");
+    std::vector<int> want_gen = golden_greedy_ids(golden_dir + "/meta.json", prompt);
+
+    const Tensor& ids_t = golden.get("input_ids");
+    std::vector<int> ids(size_t(ids_t.numel()));
+    std::memcpy(ids.data(), ids_t.data, ids.size() * 4);
+    int max_seq = int(ids.size() + want_gen.size()) + 1;
+
+    if (backend == "cpu") {
+        Model model(model_dir, max_seq);
+        std::printf("backend: cpu\n");
+        return run_check(model, golden, ids, want_gen);
+    }
+#ifdef ENGINE_CUDA
+    if (backend == "cuda") {
+        CudaModel model(model_dir, max_seq);
+        std::printf("backend: cuda (%s)\n", model.device_name().c_str());
+        return run_check(model, golden, ids, want_gen);
+    }
+#endif
+    std::printf("unknown or unavailable backend: %s\n", backend.c_str());
+    return 1;
+}
+
+// Plain greedy decode for n tokens, no taps, just speed.
+template <typename M>
+void run_bench(M& model, int n) {
+    int tok = 1; // BOS
+    model.forward(tok, 0); // warm up
+    auto t0 = std::chrono::steady_clock::now();
+    for (int pos = 1; pos <= n; ++pos) tok = argmax(model.forward(tok, pos));
+    double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("%d tokens in %.2fs: %.2f tok/s (%.1f ms/token)\n", n, s, n / s, 1000.0 * s / n);
+}
+
+int bench(const std::string& model_dir, const std::string& backend, int n) {
+    if (backend == "cpu") {
+        Model model(model_dir, n + 2);
+        std::printf("backend: cpu\n");
+        run_bench(model, n);
+        return 0;
+    }
+#ifdef ENGINE_CUDA
+    if (backend == "cuda") {
+        CudaModel model(model_dir, n + 2);
+        std::printf("backend: cuda (%s)\n", model.device_name().c_str());
+        run_bench(model, n);
+        return 0;
+    }
+#endif
+    std::printf("unknown or unavailable backend: %s\n", backend.c_str());
+    return 1;
+}
+
 void usage() {
     std::printf("usage:\n");
     std::printf("  engine inspect <file.safetensors>\n");
     std::printf("  engine check-embed <model.safetensors> <golden.safetensors>\n");
-    std::printf("  engine check <model_dir> <golden_dir> <prompt>\n");
+    std::printf("  engine check <model_dir> <golden_dir> <prompt> [cpu|cuda]\n");
+    std::printf("  engine bench <model_dir> [cpu|cuda] [tokens]\n");
 }
 
 } // namespace
@@ -234,7 +288,10 @@ int main(int argc, char** argv) {
     try {
         if (cmd == "inspect" && argc == 3) return inspect(argv[2]);
         if (cmd == "check-embed" && argc == 4) return check_embed(argv[2], argv[3]);
-        if (cmd == "check" && argc == 5) return check(argv[2], argv[3], argv[4]);
+        if (cmd == "check" && (argc == 5 || argc == 6))
+            return check(argv[2], argv[3], argv[4], argc == 6 ? argv[5] : "cpu");
+        if (cmd == "bench" && argc >= 3 && argc <= 5)
+            return bench(argv[2], argc >= 4 ? argv[3] : "cpu", argc == 5 ? std::atoi(argv[4]) : 128);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;
