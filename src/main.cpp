@@ -132,9 +132,12 @@ Diff compare(const std::vector<float>& ours, const std::vector<float>& ref) {
 
 // Full forward pass vs golden, checkpoint by checkpoint, then greedy generation.
 // Works for both Model (CPU) and CudaModel.
+// strict: every checkpoint within tol and identical greedy output (full-precision backends).
+// Quantized backends drift by design, so for them we report the numbers and only require
+// the next token to match.
 template <typename M>
-int run_check(M& model, const SafeTensors& golden, const std::vector<int>& ids, const std::vector<int>& want_gen) {
-    const float tol = 1e-3f;
+int run_check(M& model, const SafeTensors& golden, const std::vector<int>& ids, const std::vector<int>& want_gen,
+              float tol, bool strict) {
     const Config& c = model.config();
     std::printf("model: dim %d, %d layers, %d heads (%d kv), head_dim %d, vocab %d\n",
                 c.dim, c.n_layers, c.n_heads, c.n_kv_heads, c.head_dim, c.vocab);
@@ -154,13 +157,13 @@ int run_check(M& model, const SafeTensors& golden, const std::vector<int>& ids, 
     bool ok = true;
     auto check_one = [&](const std::string& name) -> Diff {
         Diff d = compare(got.at(name), to_f32(golden.get(name)));
-        if (d.rel > tol) ok = false;
+        if (d.rel > tol && strict) ok = false;
         return d;
     };
 
     Diff e = check_one("embed");
     std::printf("\n%-8s rel %.2e\n", "embed", e.rel);
-    for (int i = 0; i < c.n_layers && ok; ++i) {
+    for (int i = 0; i < c.n_layers && (ok || !strict); ++i) {
         std::string p = "layer" + std::to_string(i) + ".";
         const char* parts[] = {"attn_norm", "attn_out", "mlp_norm", "mlp_out", "out"};
         std::printf("layer %2d", i);
@@ -170,10 +173,11 @@ int run_check(M& model, const SafeTensors& golden, const std::vector<int>& ids, 
         }
         std::printf("\n");
     }
-    if (!ok) {
+    if (!ok && strict) {
         std::printf("\nFAIL: stopped at the first layer that drifted past %.0e\n", tol);
         return 1;
     }
+    ok = true; // non-strict: layer drift is reported, not failed
 
     Diff fn = check_one("final_norm");
     Diff lg = check_one("logits");
@@ -204,12 +208,44 @@ int run_check(M& model, const SafeTensors& golden, const std::vector<int>& ids, 
     std::printf("\ngreedy hf:  ");
     for (int t : want_gen) std::printf(" %d", t);
     std::printf("\n%s\n", gen_ok ? "generation matches" : "generation differs");
-    if (!gen_ok) ok = false;
+    if (!gen_ok && strict) ok = false;
 
     std::printf("\nprefill %zu tokens in %.2fs, generated %zu tokens at %.2f tok/s\n",
                 ids.size(), prefill_s, gen.size(), (gen.size() - 1) / std::max(gen_s, 1e-9));
     std::printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
+}
+
+bool is_quantized(const std::string& backend) {
+    return backend.find("-q") != std::string::npos;
+}
+
+// Builds the model for a backend name and hands it to fn. Keeps every command backend-agnostic.
+template <typename F>
+int with_model(const std::string& backend, const std::string& model_dir, int max_seq, F&& fn) {
+    if (backend == "cpu") {
+        Model model(model_dir, max_seq);
+        std::printf("backend: cpu\n");
+        return fn(model);
+    }
+#ifdef ENGINE_CUDA
+    Quant q;
+    bool known = true;
+    if (backend == "cuda") q = Quant::BF16;
+    else if (backend == "cuda-q8") q = Quant::Q8;
+    else if (backend == "cuda-q4") q = Quant::Q4;
+    else known = false;
+    if (known) {
+        auto t0 = std::chrono::steady_clock::now();
+        CudaModel model(model_dir, max_seq, q);
+        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("backend: %s (%s), load %.1fs, weights %.2f GB on GPU\n", backend.c_str(),
+                    model.device_name().c_str(), s, model.weight_bytes() / 1e9);
+        return fn(model);
+    }
+#endif
+    std::printf("unknown or unavailable backend: %s (try cpu, cuda, cuda-q8, cuda-q4)\n", backend.c_str());
+    return 1;
 }
 
 int check(const std::string& model_dir, const std::string& golden_dir, const std::string& prompt,
@@ -222,58 +258,76 @@ int check(const std::string& model_dir, const std::string& golden_dir, const std
     std::memcpy(ids.data(), ids_t.data, ids.size() * 4);
     int max_seq = int(ids.size() + want_gen.size()) + 1;
 
-    if (backend == "cpu") {
-        Model model(model_dir, max_seq);
-        std::printf("backend: cpu\n");
-        return run_check(model, golden, ids, want_gen);
-    }
-#ifdef ENGINE_CUDA
-    if (backend == "cuda") {
-        CudaModel model(model_dir, max_seq);
-        std::printf("backend: cuda (%s)\n", model.device_name().c_str());
-        return run_check(model, golden, ids, want_gen);
-    }
-#endif
-    std::printf("unknown or unavailable backend: %s\n", backend.c_str());
-    return 1;
+    bool quant = is_quantized(backend);
+    return with_model(backend, model_dir, max_seq, [&](auto& model) {
+        return run_check(model, golden, ids, want_gen, quant ? 0.1f : 1e-3f, !quant);
+    });
 }
 
 // Plain greedy decode for n tokens, no taps, just speed.
-template <typename M>
-void run_bench(M& model, int n) {
-    int tok = 1; // BOS
-    model.forward(tok, 0); // warm up
-    auto t0 = std::chrono::steady_clock::now();
-    for (int pos = 1; pos <= n; ++pos) tok = argmax(model.forward(tok, pos));
-    double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("%d tokens in %.2fs: %.2f tok/s (%.1f ms/token)\n", n, s, n / s, 1000.0 * s / n);
+int bench(const std::string& model_dir, const std::string& backend, int n) {
+    return with_model(backend, model_dir, n + 2, [&](auto& model) {
+        int tok = 1; // BOS
+        model.forward(tok, 0); // warm up
+        auto t0 = std::chrono::steady_clock::now();
+        for (int pos = 1; pos <= n; ++pos) tok = argmax(model.forward(tok, pos));
+        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("%d tokens in %.2fs: %.2f tok/s (%.1f ms/token)\n", n, s, n / s, 1000.0 * s / n);
+        return 0;
+    });
 }
 
-int bench(const std::string& model_dir, const std::string& backend, int n) {
-    if (backend == "cpu") {
-        Model model(model_dir, n + 2);
-        std::printf("backend: cpu\n");
-        run_bench(model, n);
+double meta_number(const std::string& meta_path, const std::string& key) {
+    std::ifstream f(meta_path);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::string text = ss.str();
+    size_t at = text.find("\"" + key + "\"");
+    if (at == std::string::npos) return NAN;
+    at = text.find(':', at);
+    return std::strtod(text.c_str() + at + 1, nullptr);
+}
+
+// Perplexity over golden/ppl_tokens.bin: how surprised the model is by real text.
+// exp(mean negative log-likelihood of each next token). Lower is better.
+int ppl(const std::string& model_dir, const std::string& golden_dir, const std::string& backend) {
+    std::ifstream f(golden_dir + "/ppl_tokens.bin", std::ios::binary);
+    if (!f) throw std::runtime_error("no " + golden_dir + "/ppl_tokens.bin, rerun tools/golden.py");
+    std::vector<int32_t> toks;
+    int32_t t;
+    while (f.read(reinterpret_cast<char*>(&t), 4)) toks.push_back(t);
+    if (toks.size() < 2) throw std::runtime_error("ppl_tokens.bin is too short");
+
+    double hf = meta_number(golden_dir + "/meta.json", "ppl_hf");
+
+    return with_model(backend, model_dir, int(toks.size()) + 1, [&](auto& model) {
+        auto t0 = std::chrono::steady_clock::now();
+        double nll = 0.0;
+        for (size_t i = 0; i + 1 < toks.size(); ++i) {
+            const std::vector<float>& logits = model.forward(toks[i], int(i));
+            double mx = *std::max_element(logits.begin(), logits.end());
+            double sum = 0.0;
+            for (float v : logits) sum += std::exp(double(v) - mx);
+            double logp = double(logits[toks[i + 1]]) - mx - std::log(sum);
+            nll -= logp;
+        }
+        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        double ours = std::exp(nll / double(toks.size() - 1));
+        std::printf("perplexity over %zu tokens: %.4f", toks.size(), ours);
+        if (!std::isnan(hf)) std::printf("  (hf fp32: %.4f, diff %+.2f%%)", hf, 100.0 * (ours - hf) / hf);
+        std::printf("\n%.1fs\n", s);
         return 0;
-    }
-#ifdef ENGINE_CUDA
-    if (backend == "cuda") {
-        CudaModel model(model_dir, n + 2);
-        std::printf("backend: cuda (%s)\n", model.device_name().c_str());
-        run_bench(model, n);
-        return 0;
-    }
-#endif
-    std::printf("unknown or unavailable backend: %s\n", backend.c_str());
-    return 1;
+    });
 }
 
 void usage() {
     std::printf("usage:\n");
     std::printf("  engine inspect <file.safetensors>\n");
     std::printf("  engine check-embed <model.safetensors> <golden.safetensors>\n");
-    std::printf("  engine check <model_dir> <golden_dir> <prompt> [cpu|cuda]\n");
-    std::printf("  engine bench <model_dir> [cpu|cuda] [tokens]\n");
+    std::printf("  engine check <model_dir> <golden_dir> <prompt> [backend]\n");
+    std::printf("  engine bench <model_dir> [backend] [tokens]\n");
+    std::printf("  engine ppl <model_dir> <golden_dir> [backend]\n");
+    std::printf("backends: cpu, cuda, cuda-q8, cuda-q4\n");
 }
 
 } // namespace
@@ -292,6 +346,7 @@ int main(int argc, char** argv) {
             return check(argv[2], argv[3], argv[4], argc == 6 ? argv[5] : "cpu");
         if (cmd == "bench" && argc >= 3 && argc <= 5)
             return bench(argv[2], argc >= 4 ? argv[3] : "cpu", argc == 5 ? std::atoi(argv[4]) : 128);
+        if (cmd == "ppl" && (argc == 4 || argc == 5)) return ppl(argv[2], argv[3], argc == 5 ? argv[4] : "cpu");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

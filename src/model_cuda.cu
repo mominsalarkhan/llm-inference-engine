@@ -1,12 +1,15 @@
 #include "model_cuda.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "safetensors.h"
@@ -100,6 +103,79 @@ __global__ void matvec_bf16_kernel(float* out, const uint16_t* W, const float* x
     const uint16_t* w = W + size_t(row) * cols;
     float sum = 0.0f;
     for (int c = lane; c < cols; c += 32) sum += bf16_to_f32(w[c]) * x[c];
+    sum = warp_sum(sum);
+    if (lane == 0) out[row] = sum;
+}
+
+constexpr int Q8_GROUP = 128; // weights per scale; one warp covers exactly one group per step
+
+// INT8 weights with one fp32 scale per 128 weights. One warp per row: each lane loads
+// 4 int8 weights as a single 32-bit word and the matching 4 inputs as a float4, so one
+// step of the loop is one full group and the scale is shared by the whole warp.
+__global__ void matvec_q8_kernel(float* out, const int8_t* Wq, const float* scales, const float* x, int rows,
+                                 int cols) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= rows) return;
+
+    int groups = cols / Q8_GROUP;
+    const int* w = reinterpret_cast<const int*>(Wq + size_t(row) * cols);
+    const float* sc = scales + size_t(row) * groups;
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+
+    float sum = 0.0f;
+    for (int g = 0; g < groups; ++g) {
+        int packed = w[g * 32 + lane];
+        float4 xv = x4[g * 32 + lane];
+        float d = float(int8_t(packed)) * xv.x + float(int8_t(packed >> 8)) * xv.y +
+                  float(int8_t(packed >> 16)) * xv.z + float(int8_t(packed >> 24)) * xv.w;
+        sum += d * sc[g];
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) out[row] = sum;
+}
+
+constexpr int Q4_GROUP = 64; // weights per (scale, min) pair
+
+// INT4 weights, two per byte (low nibble first), asymmetric: w = q * scale + min, q in 0..15.
+// Each group of 64 has its own (scale, min) stored as one half2.
+// One warp per row; each lane loads 8 bytes = 16 weights, so a warp covers 512 weights per step.
+// Since w = q*scale + min, the dot product splits into scale * sum(q*x) + min * sum(x).
+__global__ void matvec_q4_kernel(float* out, const uint8_t* Wq, const __half2* sm, const float* x, int rows,
+                                 int cols) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= rows) return;
+
+    const uint2* w = reinterpret_cast<const uint2*>(Wq + size_t(row) * (cols / 2));
+    const __half2* g = sm + size_t(row) * (cols / Q4_GROUP);
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+
+    float sum = 0.0f;
+    int steps = cols / 512;
+    for (int it = 0; it < steps; ++it) {
+        uint2 packed = w[it * 32 + lane];
+        int base = it * 512 + lane * 16; // index of this lane's first weight
+        float2 s = __half22float2(g[base / Q4_GROUP]);
+
+        float4 xa = x4[base / 4];
+        float4 xb = x4[base / 4 + 1];
+        float4 xc = x4[base / 4 + 2];
+        float4 xd = x4[base / 4 + 3];
+        float xs[16] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w,
+                        xc.x, xc.y, xc.z, xc.w, xd.x, xd.y, xd.z, xd.w};
+
+        float sq = 0.0f;
+        float sx = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            uint32_t word = k < 8 ? packed.x : packed.y;
+            float q = float((word >> (4 * (k & 7))) & 0xF);
+            sq += q * xs[k];
+            sx += xs[k];
+        }
+        sum += s.x * sq + s.y * sx;
+    }
     sum = warp_sum(sum);
     if (lane == 0) out[row] = sum;
 }
@@ -203,18 +279,31 @@ inline int blocks_for(int n, int threads) {
 // ---------- host side ----------
 
 struct CudaModel::Impl {
+    // A weight matrix on the GPU, in whichever format we loaded it as.
+    struct Mat {
+        uint16_t* bf16 = nullptr;
+        int8_t* q8 = nullptr;
+        float* scales = nullptr;
+        uint8_t* q4 = nullptr;
+        __half2* q4_sm = nullptr; // (scale, min) per group of 64
+        int rows = 0;
+        int cols = 0;
+    };
+
     struct Layer {
         float* attn_norm;
         float* mlp_norm;
-        uint16_t* wqkv; // [q_dim + 2*kv_dim, dim]
-        uint16_t* wo;
-        uint16_t* wgu; // [2*hidden, dim], gate rows then up rows
-        uint16_t* down;
+        Mat wqkv; // [q_dim + 2*kv_dim, dim]
+        Mat wo;
+        Mat wgu; // [2*hidden, dim], gate rows then up rows
+        Mat down;
     };
 
+    Quant quant = Quant::BF16;
+    size_t weight_bytes = 0;
     std::vector<void*> allocations;
-    uint16_t* embed = nullptr;
-    uint16_t* lm_head = nullptr;
+    uint16_t* embed = nullptr; // embedding stays BF16: we only ever read one row of it
+    Mat lm_head;
     float* final_norm = nullptr;
     std::vector<Layer> layers;
 
@@ -248,24 +337,135 @@ struct CudaModel::Impl {
         return static_cast<T*>(p);
     }
 
-    // Upload one or more BF16 matrices stacked by rows into a single buffer.
-    uint16_t* upload_rows(const SafeTensors& st, const std::vector<std::string>& names,
-                          const std::vector<int64_t>& rows, int64_t cols) {
-        int64_t total = 0;
-        for (int64_t r : rows) total += r;
-        uint16_t* d = alloc<uint16_t>(size_t(total * cols));
+    // Stack one or more BF16 matrices by rows into a single GPU matrix, quantizing on the way if asked.
+    Mat upload(const SafeTensors& st, const std::vector<std::string>& names, const std::vector<int64_t>& rows,
+               int64_t cols, Quant fmt) {
+        Mat m;
+        for (int64_t r : rows) m.rows += int(r);
+        m.cols = int(cols);
 
-        int64_t offset = 0;
         for (size_t i = 0; i < names.size(); ++i) {
             const Tensor& t = st.get(names[i]);
             if (t.dtype != DType::BF16)
-                throw std::runtime_error(names[i] + ": CUDA path only handles BF16 weights for now");
+                throw std::runtime_error(names[i] + ": CUDA path only handles BF16 checkpoints for now");
             if (t.shape.size() != 2 || t.shape[0] != rows[i] || t.shape[1] != cols)
                 throw std::runtime_error(names[i] + ": unexpected shape");
-            CUDA_CHECK(cudaMemcpy(d + offset * cols, t.data, t.nbytes, cudaMemcpyHostToDevice));
-            offset += rows[i];
         }
-        return d;
+
+        if (fmt == Quant::BF16) {
+            m.bf16 = alloc<uint16_t>(size_t(m.rows) * cols);
+            int64_t offset = 0;
+            for (size_t i = 0; i < names.size(); ++i) {
+                const Tensor& t = st.get(names[i]);
+                CUDA_CHECK(cudaMemcpy(m.bf16 + offset * cols, t.data, t.nbytes, cudaMemcpyHostToDevice));
+                offset += rows[i];
+            }
+            weight_bytes += size_t(m.rows) * cols * 2;
+            return m;
+        }
+
+        // Everything below quantizes on the CPU once at load, spread over all cores.
+        // fn(global_row, weights_as_float) is called for every row of every stacked matrix.
+        auto for_each_row = [&](auto&& fn) {
+            int64_t offset = 0;
+            for (size_t i = 0; i < names.size(); ++i) {
+                const Tensor& t = st.get(names[i]);
+                int64_t base = offset;
+                auto work = [&, base](int64_t r0, int64_t r1) {
+                    std::vector<float> row(static_cast<size_t>(cols));
+                    for (int64_t r = r0; r < r1; ++r) {
+                        to_f32(t, size_t(r * cols), size_t(cols), row.data());
+                        fn(base + r, row.data());
+                    }
+                };
+                int n_threads = int(std::max(1u, std::thread::hardware_concurrency()));
+                int64_t chunk = (rows[i] + n_threads - 1) / n_threads;
+                std::vector<std::thread> pool;
+                for (int k = 0; k < n_threads; ++k) {
+                    int64_t r0 = k * chunk;
+                    int64_t r1 = std::min(rows[i], r0 + chunk);
+                    if (r0 < r1) pool.emplace_back(work, r0, r1);
+                }
+                for (auto& th : pool) th.join();
+                offset += rows[i];
+            }
+        };
+
+        if (fmt == Quant::Q8) {
+            // symmetric: scale = max|w| / 127 per group of 128, q = round(w / scale)
+            if (cols % Q8_GROUP != 0) throw std::runtime_error(names[0] + ": cols not a multiple of 128");
+            int groups = int(cols / Q8_GROUP);
+            std::vector<int8_t> hq(size_t(m.rows) * cols);
+            std::vector<float> hs(size_t(m.rows) * groups);
+
+            for_each_row([&](int64_t r, const float* row) {
+                for (int g = 0; g < groups; ++g) {
+                    const float* w = row + g * Q8_GROUP;
+                    float amax = 0.0f;
+                    for (int k = 0; k < Q8_GROUP; ++k) amax = std::max(amax, std::fabs(w[k]));
+                    float scale = amax / 127.0f;
+                    float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+                    int8_t* q = hq.data() + size_t(r) * cols + g * Q8_GROUP;
+                    for (int k = 0; k < Q8_GROUP; ++k) {
+                        float v = std::nearbyint(w[k] * inv);
+                        q[k] = int8_t(std::max(-127.0f, std::min(127.0f, v)));
+                    }
+                    hs[size_t(r) * groups + g] = scale;
+                }
+            });
+
+            m.q8 = alloc<int8_t>(hq.size());
+            m.scales = alloc<float>(hs.size());
+            CUDA_CHECK(cudaMemcpy(m.q8, hq.data(), hq.size(), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(m.scales, hs.data(), hs.size() * sizeof(float), cudaMemcpyHostToDevice));
+            weight_bytes += hq.size() + hs.size() * sizeof(float);
+            return m;
+        }
+
+        // Q4: asymmetric per group of 64. min and max of the group map to 0 and 15,
+        // step = (max - min) / 15. scale and min are rounded to fp16 first and the
+        // quantization uses the rounded values, so the GPU sees exactly what we computed with.
+        if (cols % 512 != 0) throw std::runtime_error(names[0] + ": cols not a multiple of 512");
+        int groups = int(cols / Q4_GROUP);
+        std::vector<uint8_t> hq(size_t(m.rows) * cols / 2);
+        std::vector<__half2> hsm(size_t(m.rows) * groups);
+
+        for_each_row([&](int64_t r, const float* row) {
+            for (int g = 0; g < groups; ++g) {
+                const float* w = row + g * Q4_GROUP;
+                float lo = w[0];
+                float hi = w[0];
+                for (int k = 1; k < Q4_GROUP; ++k) {
+                    lo = std::min(lo, w[k]);
+                    hi = std::max(hi, w[k]);
+                }
+                __half h_scale = __float2half((hi - lo) / 15.0f);
+                __half h_min = __float2half(lo);
+                float scale = __half2float(h_scale);
+                float mn = __half2float(h_min);
+                float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+                uint8_t* q = hq.data() + (size_t(r) * cols + g * Q4_GROUP) / 2;
+                for (int k = 0; k < Q4_GROUP; k += 2) {
+                    int a = int(std::nearbyint((w[k] - mn) * inv));
+                    int b = int(std::nearbyint((w[k + 1] - mn) * inv));
+                    a = std::max(0, std::min(15, a));
+                    b = std::max(0, std::min(15, b));
+                    q[k / 2] = uint8_t(a | (b << 4));
+                }
+                __half2 packed_sm;
+                packed_sm.x = h_scale;
+                packed_sm.y = h_min;
+                hsm[size_t(r) * groups + g] = packed_sm;
+            }
+        });
+
+        m.q4 = alloc<uint8_t>(hq.size());
+        m.q4_sm = alloc<__half2>(hsm.size());
+        CUDA_CHECK(cudaMemcpy(m.q4, hq.data(), hq.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m.q4_sm, hsm.data(), hsm.size() * sizeof(__half2), cudaMemcpyHostToDevice));
+        weight_bytes += hq.size() + hsm.size() * sizeof(__half2);
+        return m;
     }
 
     // Norm weights are tiny, convert to fp32 on the host first.
@@ -277,10 +477,11 @@ struct CudaModel::Impl {
     }
 };
 
-CudaModel::CudaModel(const std::string& model_dir, int max_seq)
+CudaModel::CudaModel(const std::string& model_dir, int max_seq, Quant quant)
     : cfg_(load_config(model_dir + "/config.json")), max_seq_(max_seq), impl_(new Impl) {
     const Config& c = cfg_;
     Impl& m = *impl_;
+    m.quant = quant;
 
     int q_dim = c.n_heads * c.head_dim;
     int kv_dim = c.n_kv_heads * c.head_dim;
@@ -288,8 +489,10 @@ CudaModel::CudaModel(const std::string& model_dir, int max_seq)
     // the mmap only needs to live while we copy to the GPU
     SafeTensors st(model_dir + "/model.safetensors");
 
-    m.embed = m.upload_rows(st, {"model.embed_tokens.weight"}, {c.vocab}, c.dim);
-    m.lm_head = st.has("lm_head.weight") ? m.upload_rows(st, {"lm_head.weight"}, {c.vocab}, c.dim) : m.embed;
+    m.embed = m.upload(st, {"model.embed_tokens.weight"}, {c.vocab}, c.dim, Quant::BF16).bf16;
+    std::string head = st.has("lm_head.weight") ? "lm_head.weight" : "model.embed_tokens.weight";
+    // the output layer picks the next word, so in 4-bit mode it stays 8-bit
+    m.lm_head = m.upload(st, {head}, {c.vocab}, c.dim, quant == Quant::Q4 ? Quant::Q8 : quant);
     m.final_norm = m.upload_f32(st, "model.norm.weight");
 
     for (int i = 0; i < c.n_layers; ++i) {
@@ -297,14 +500,14 @@ CudaModel::CudaModel(const std::string& model_dir, int max_seq)
         Impl::Layer l;
         l.attn_norm = m.upload_f32(st, p + "input_layernorm.weight");
         l.mlp_norm = m.upload_f32(st, p + "post_attention_layernorm.weight");
-        l.wqkv = m.upload_rows(st,
-                               {p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
-                                p + "self_attn.v_proj.weight"},
-                               {q_dim, kv_dim, kv_dim}, c.dim);
-        l.wo = m.upload_rows(st, {p + "self_attn.o_proj.weight"}, {c.dim}, q_dim);
-        l.wgu = m.upload_rows(st, {p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"},
-                              {c.hidden_dim, c.hidden_dim}, c.dim);
-        l.down = m.upload_rows(st, {p + "mlp.down_proj.weight"}, {c.dim}, c.hidden_dim);
+        l.wqkv = m.upload(st,
+                          {p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
+                           p + "self_attn.v_proj.weight"},
+                          {q_dim, kv_dim, kv_dim}, c.dim, quant);
+        l.wo = m.upload(st, {p + "self_attn.o_proj.weight"}, {c.dim}, q_dim, quant);
+        l.wgu = m.upload(st, {p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"},
+                         {c.hidden_dim, c.hidden_dim}, c.dim, quant);
+        l.down = m.upload(st, {p + "mlp.down_proj.weight"}, {c.dim}, c.hidden_dim, quant);
         m.layers.push_back(l);
     }
 
@@ -337,6 +540,10 @@ CudaModel::CudaModel(const std::string& model_dir, int max_seq)
 
 CudaModel::~CudaModel() = default;
 
+size_t CudaModel::weight_bytes() const {
+    return impl_->weight_bytes;
+}
+
 std::string CudaModel::device_name() const {
     int dev = 0;
     cudaDeviceProp prop;
@@ -362,15 +569,19 @@ void CudaModel::enqueue(const Tap* tap) {
     const int T = 256;
     int dim = c.dim;
     int hd = c.head_dim;
-    int q_dim = c.n_heads * hd;
     int kv_dim = c.n_kv_heads * hd;
     int group = c.n_heads / c.n_kv_heads;
     float scale = 1.0f / std::sqrt(float(hd));
     int n_post = (c.n_heads + c.n_kv_heads) * hd / 2 + kv_dim;
 
-    auto matvec = [&](float* out, const uint16_t* w, const float* x, int rows, int cols) {
-        int warps_per_block = T / 32;
-        matvec_bf16_kernel<<<blocks_for(rows, warps_per_block), T, 0, s>>>(out, w, x, rows, cols);
+    auto matvec = [&](float* out, const Impl::Mat& w, const float* x) {
+        int grid = blocks_for(w.rows, T / 32);
+        if (w.q4)
+            matvec_q4_kernel<<<grid, T, 0, s>>>(out, w.q4, w.q4_sm, x, w.rows, w.cols);
+        else if (w.q8)
+            matvec_q8_kernel<<<grid, T, 0, s>>>(out, w.q8, w.scales, x, w.rows, w.cols);
+        else
+            matvec_bf16_kernel<<<grid, T, 0, s>>>(out, w.bf16, x, w.rows, w.cols);
     };
 
     embed_kernel<<<blocks_for(dim, T), T, 0, s>>>(m.x, m.embed, m.state, dim);
@@ -385,22 +596,22 @@ void CudaModel::enqueue(const Tap* tap) {
         rmsnorm_kernel<<<1, 1024, 0, s>>>(m.xb, m.x, L.attn_norm, dim, c.norm_eps);
         emit(p + "attn_norm", m.xb, dim);
 
-        matvec(m.qkv, L.wqkv, m.xb, q_dim + 2 * kv_dim, dim);
+        matvec(m.qkv, L.wqkv, m.xb);
         qkv_post_kernel<<<blocks_for(n_post, T), T, 0, s>>>(m.qkv, k_layer, v_layer, m.state, c.n_heads,
                                                             c.n_kv_heads, hd, c.rope_theta);
         attention_kernel<<<c.n_heads, 128, m.attn_smem, s>>>(m.attn, m.qkv, k_layer, v_layer, m.state, hd,
                                                              kv_dim, group, scale);
 
-        matvec(m.xb, L.wo, m.attn, dim, q_dim);
+        matvec(m.xb, L.wo, m.attn);
         emit(p + "attn_out", m.xb, dim);
         add_kernel<<<blocks_for(dim, T), T, 0, s>>>(m.x, m.xb, dim);
 
         rmsnorm_kernel<<<1, 1024, 0, s>>>(m.xb, m.x, L.mlp_norm, dim, c.norm_eps);
         emit(p + "mlp_norm", m.xb, dim);
 
-        matvec(m.h, L.wgu, m.xb, 2 * c.hidden_dim, dim);
+        matvec(m.h, L.wgu, m.xb);
         silu_mul_kernel<<<blocks_for(c.hidden_dim, T), T, 0, s>>>(m.h, c.hidden_dim);
-        matvec(m.xb, L.down, m.h, dim, c.hidden_dim);
+        matvec(m.xb, L.down, m.h);
         emit(p + "mlp_out", m.xb, dim);
         add_kernel<<<blocks_for(dim, T), T, 0, s>>>(m.x, m.xb, dim);
 
@@ -410,7 +621,7 @@ void CudaModel::enqueue(const Tap* tap) {
     rmsnorm_kernel<<<1, 1024, 0, s>>>(m.xb, m.x, m.final_norm, dim, c.norm_eps);
     emit("final_norm", m.xb, dim);
 
-    matvec(m.logits, m.lm_head, m.xb, c.vocab, dim);
+    matvec(m.logits, m.lm_head, m.xb);
     emit("logits", m.logits, c.vocab);
 }
 
