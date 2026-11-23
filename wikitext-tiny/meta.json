@@ -1,0 +1,8 @@
+{
+  "model": "models/tinyllama",
+  "dataset": "wikitext-2-raw-v1 test",
+  "ppl_tokens": 16384,
+  "ppl_window": 512,
+  "test_set_tokens": 341469,
+  "ppl_hf": 10.118424876823733
+}

@@ -1,0 +1,6 @@
+== cuda-q8
+perplexity over 16384 tokens (32 windows of 512): 6.5359
+== cuda-q4
+perplexity over 16384 tokens (32 windows of 512): 6.8283
+== cuda-q4awq
+perplexity over 16384 tokens (32 windows of 512): 6.6332

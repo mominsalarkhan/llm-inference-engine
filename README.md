@@ -8,6 +8,17 @@ Runs Llama-architecture models (TinyLlama 1.1B, Mistral 7B) on a consumer RTX 30
 
 All numbers on an RTX 3060 (12 GB, 360 GB/s), single-stream decode at batch size 1.
 
+**WikiText-2 perplexity** (first 16,384 test tokens, 512-token windows; percentages above each model's reference)
+
+| Model | Reference | Q8 | Q4 round-to-nearest | Q4 activation-weighted | Gap closed |
+| --- | --- | --- | --- | --- | --- |
+| TinyLlama 1.1B | HF fp32, 10.1184 | 10.1268 (+0.08%) | 11.1180 (+9.88%) | 10.4486 (+3.26%) | 67% |
+| Mistral 7B | own Q8, 6.5359 | 6.5359 | 6.8283 (+4.47%) | 6.6332 (+1.49%) | 67% |
+
+The engine's BF16 path scores 10.1185 on the same TinyLlama windows, against 10.1184 for Hugging Face in fp32.
+
+The tables below use a shorter held-out passage (about 460 tokens) from earlier in development.
+
 **Mistral 7B**
 
 | Format | Weights on GPU | Decode | Perplexity |
@@ -28,7 +39,15 @@ BF16 Mistral (14.5 GB) does not fit on the card, which is the point of quantizin
 | Q4, unweighted error search | 0.74 GB | 355 tok/s | 9.4972 (+7.14%) |
 | Q4, activation-weighted | 0.74 GB | 355 tok/s | 8.9749 (+1.24%) |
 
-Perplexity is measured on a held-out passage of about 460 tokens; calibration uses a different passage. See the write-up for the method and its limits.
+Calibration for activation-weighted Q4 always uses a separate passage, never the text being scored.
+
+**Reproduce WikiText-2**
+
+```
+pip install pyarrow
+python tools/wikitext.py models/tinyllama wikitext-tiny --hf-ref
+ENGINE_CALIB=golden/calib.safetensors ./build/engine ppl models/tinyllama wikitext-tiny cuda-q4awq
+```
 
 **Correctness.** The CPU and CUDA paths match Hugging Face Transformers (fp32) at five checkpoints in each of TinyLlama's 22 layers, within 2e-5 relative error, and reproduce its greedy output token for token.
 
@@ -113,6 +132,7 @@ src/ops.*           CPU math: RMSNorm, matvec, RoPE, softmax
 src/model_cuda.*    GPU weights, quantization, kernels, CUDA graph
 src/main.cpp        commands: inspect, check, bench, ppl, generate, calibrate
 tools/golden.py     Hugging Face reference activations, perplexity and calibration text
+tools/wikitext.py   WikiText-2 test tokens and the Hugging Face reference score
 tools/run.py        prompt in, text out (tokenizer in Python, all math in the engine)
 ```
 
@@ -125,6 +145,8 @@ tools/run.py        prompt in, text out (tokenizer in Python, all math in the en
 - [x] Mistral 7B in 4.3 GB at 72 tok/s
 - [x] Activation-weighted INT4 rounding
 - [x] Temperature and top-p sampling
-- [ ] WikiText-2 evaluation; comparison with AWQ, GPTQ and llama.cpp at equal bits
+- [x] WikiText-2 evaluation (16k-token subset)
+- [ ] Batched prefill, so the full WikiText-2 test set scores in minutes
+- [ ] Comparison with AWQ, GPTQ and llama.cpp at equal bits
 - [ ] KV cache quantization
 - [ ] Paged KV cache and continuous batching

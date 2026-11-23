@@ -305,28 +305,43 @@ double meta_number(const std::string& meta_path, const std::string& key) {
     return std::strtod(text.c_str() + at + 1, nullptr);
 }
 
-// Perplexity over golden/ppl_tokens.bin: how surprised the model is by real text.
+// Perplexity over <dir>/ppl_tokens.bin: how surprised the model is by real text.
 // exp(mean negative log-likelihood of each next token). Lower is better.
+// If meta.json sets ppl_window, the tokens are scored in non-overlapping windows of that
+// size with a fresh KV cache each (the standard WikiText-2 setup); otherwise as one sequence.
 int ppl(const std::string& model_dir, const std::string& golden_dir, const std::string& backend) {
     std::vector<int32_t> toks = read_tokens(golden_dir + "/ppl_tokens.bin");
     if (toks.size() < 2) throw std::runtime_error("ppl_tokens.bin is too short");
 
-    double hf = meta_number(golden_dir + "/meta.json", "ppl_hf");
+    std::string meta = golden_dir + "/meta.json";
+    double hf = meta_number(meta, "ppl_hf");
+    double win = meta_number(meta, "ppl_window");
+    size_t window = std::isnan(win) || win < 2 ? toks.size() : size_t(win);
 
-    return with_model(backend, model_dir, int(toks.size()) + 1, [&](auto& model) {
+    return with_model(backend, model_dir, int(window) + 1, [&](auto& model) {
         auto t0 = std::chrono::steady_clock::now();
         double nll = 0.0;
-        for (size_t i = 0; i + 1 < toks.size(); ++i) {
-            const std::vector<float>& logits = model.forward(toks[i], int(i));
-            double mx = *std::max_element(logits.begin(), logits.end());
-            double sum = 0.0;
-            for (float v : logits) sum += std::exp(double(v) - mx);
-            double logp = double(logits[toks[i + 1]]) - mx - std::log(sum);
-            nll -= logp;
+        size_t count = 0;
+        size_t n_windows = (toks.size() + window - 1) / window;
+        for (size_t w0 = 0, wi = 0; w0 < toks.size(); w0 += window, ++wi) {
+            size_t len = std::min(window, toks.size() - w0);
+            for (size_t i = 0; i < len; ++i) {
+                const std::vector<float>& logits = model.forward(toks[w0 + i], int(i));
+                if (i + 1 == len) break;
+                double mx = *std::max_element(logits.begin(), logits.end());
+                double sum = 0.0;
+                for (float v : logits) sum += std::exp(double(v) - mx);
+                nll -= double(logits[toks[w0 + i + 1]]) - mx - std::log(sum);
+                ++count;
+            }
+            if (n_windows > 1) std::fprintf(stderr, "\r  window %zu/%zu", wi + 1, n_windows);
         }
+        if (n_windows > 1) std::fprintf(stderr, "\n");
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        double ours = std::exp(nll / double(toks.size() - 1));
-        std::printf("perplexity over %zu tokens: %.4f", toks.size(), ours);
+        double ours = std::exp(nll / double(count));
+        std::printf("perplexity over %zu tokens", toks.size());
+        if (n_windows > 1) std::printf(" (%zu windows of %zu)", n_windows, window);
+        std::printf(": %.4f", ours);
         if (!std::isnan(hf)) std::printf("  (hf fp32: %.4f, diff %+.2f%%)", hf, 100.0 * (ours - hf) / hf);
         std::printf("\n%.1fs\n", s);
         return 0;

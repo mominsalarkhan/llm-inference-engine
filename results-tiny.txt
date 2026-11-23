@@ -1,0 +1,8 @@
+== cuda
+perplexity over 16384 tokens (32 windows of 512): 10.1185  (hf fp32: 10.1184, diff +0.00%)
+== cuda-q8
+perplexity over 16384 tokens (32 windows of 512): 10.1268  (hf fp32: 10.1184, diff +0.08%)
+== cuda-q4
+perplexity over 16384 tokens (32 windows of 512): 11.1180  (hf fp32: 10.1184, diff +9.88%)
+== cuda-q4awq
+perplexity over 16384 tokens (32 windows of 512): 10.4486  (hf fp32: 10.1184, diff +3.26%)
