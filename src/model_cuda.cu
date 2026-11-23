@@ -180,6 +180,72 @@ __global__ void matvec_q4_kernel(float* out, const uint8_t* Wq, const __half2* s
     if (lane == 0) out[row] = sum;
 }
 
+// ---- faster INT4 path: integer dot products ----
+// The input vector gets quantized to int8 once per matvec (16 values share one scale),
+// laid out so each 32-bit word lines up with 4 weights pulled out of the packed nibbles.
+// Then __dp4a multiplies 4 int8 pairs and adds them in one instruction.
+//
+// A packed word holds 8 weights, two per byte (low nibble first):
+//   word & 0x0F0F0F0F        -> bytes [w0, w2, w4, w6]
+//   (word >> 4) & 0x0F0F0F0F -> bytes [w1, w3, w5, w7]
+// so the int8 inputs are stored in that same order: [x0 x2 x4 x6][x1 x3 x5 x7], per 8.
+
+__global__ void quantize_x_kernel(int8_t* xq, float2* meta, const float* x, int n) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x; // one thread per 16 values
+    if (c * 16 >= n) return;
+    const float* v = x + c * 16;
+
+    float amax = 0.0f;
+    float sum = 0.0f;
+    for (int k = 0; k < 16; ++k) {
+        amax = fmaxf(amax, fabsf(v[k]));
+        sum += v[k];
+    }
+    float scale = amax / 127.0f;
+    float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+    const int order[16] = {0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15};
+    int8_t* o = xq + c * 16;
+    for (int k = 0; k < 16; ++k) o[k] = int8_t(__float2int_rn(v[order[k]] * inv));
+    // the exact float sum goes with it: the "min" part of w = q*scale + min needs sum(x)
+    meta[c] = make_float2(scale, sum);
+}
+
+// Same weight format as matvec_q4_kernel. Per lane and step: 16 weights (8 bytes),
+// 16 int8 inputs (16 bytes), 4 dp4a instructions.
+__global__ void matvec_q4_dp4a_kernel(float* out, const uint8_t* Wq, const __half2* wsm, const int8_t* xq,
+                                      const float2* xmeta, int rows, int cols) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= rows) return;
+
+    const uint2* w = reinterpret_cast<const uint2*>(Wq + size_t(row) * (cols / 2));
+    const __half2* g = wsm + size_t(row) * (cols / Q4_GROUP);
+    const int4* xv = reinterpret_cast<const int4*>(xq);
+
+    float sum = 0.0f;
+    int steps = cols / 512;
+#pragma unroll 4
+    for (int it = 0; it < steps; ++it) {
+        int chunk = it * 32 + lane; // which run of 16 weights this lane handles
+        uint2 p = w[chunk];
+        int4 xx = xv[chunk];
+        float2 xm = xmeta[chunk];
+        float2 ws = __half22float2(g[chunk / 4]); // 4 chunks of 16 per group of 64
+
+        int d = 0;
+        d = __dp4a(int(p.x & 0x0F0F0F0Fu), xx.x, d);
+        d = __dp4a(int((p.x >> 4) & 0x0F0F0F0Fu), xx.y, d);
+        d = __dp4a(int(p.y & 0x0F0F0F0Fu), xx.z, d);
+        d = __dp4a(int((p.y >> 4) & 0x0F0F0F0Fu), xx.w, d);
+
+        // sum(w*x) = scale * sum(q*x) + min * sum(x), with sum(q*x) ~ x_scale * d
+        sum += ws.x * xm.x * float(d) + ws.y * xm.y;
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) out[row] = sum;
+}
+
 // After the fused q|k|v matvec: apply RoPE to q (in place) and k, then write k and v
 // into the KV cache at the current position. HF rotate_half layout.
 // qkv layout: [q: n_heads*hd][k: n_kv*hd][v: n_kv*hd]
@@ -310,6 +376,9 @@ struct CudaModel::Impl {
     float* k_cache = nullptr;
     float* v_cache = nullptr;
     float *x, *xb, *qkv, *attn, *h, *logits;
+    int8_t* xq = nullptr;      // int8 copy of the current matvec input (dp4a path)
+    float2* xmeta = nullptr;   // per 16 inputs: (scale, exact sum)
+    bool q4_dp4a = true;
     int* state = nullptr;      // device: [token, pos]
     int* host_state = nullptr; // pinned host copy
     size_t attn_smem = 0;
@@ -577,6 +646,10 @@ CudaModel::CudaModel(const std::string& model_dir, int max_seq, Quant quant)
     m.h = m.alloc<float>(2 * c.hidden_dim);
     m.logits = m.alloc<float>(c.vocab);
     m.state = m.alloc<int>(2);
+    int widest = std::max({c.dim, c.hidden_dim, q_dim});
+    m.xq = m.alloc<int8_t>(widest);
+    m.xmeta = m.alloc<float2>(widest / 16);
+    m.q4_dp4a = std::getenv("ENGINE_Q4_FP32") == nullptr;
     CUDA_CHECK(cudaMallocHost(&m.host_state, 2 * sizeof(int)));
 
     // attention scores need max_seq floats of shared memory; past 48KB we have to ask for it
@@ -629,7 +702,10 @@ void CudaModel::enqueue(const Tap* tap) {
 
     auto matvec = [&](float* out, const Impl::Mat& w, const float* x) {
         int grid = blocks_for(w.rows, T / 32);
-        if (w.q4)
+        if (w.q4 && m.q4_dp4a) {
+            quantize_x_kernel<<<blocks_for(w.cols / 16, T), T, 0, s>>>(m.xq, m.xmeta, x, w.cols);
+            matvec_q4_dp4a_kernel<<<grid, T, 0, s>>>(out, w.q4, w.q4_sm, m.xq, m.xmeta, w.rows, w.cols);
+        } else if (w.q4)
             matvec_q4_kernel<<<grid, T, 0, s>>>(out, w.q4, w.q4_sm, x, w.rows, w.cols);
         else if (w.q8)
             matvec_q8_kernel<<<grid, T, 0, s>>>(out, w.q8, w.scales, x, w.rows, w.cols);
