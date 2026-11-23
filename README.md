@@ -10,7 +10,7 @@ LLM inference engine in C++ and CUDA, built from scratch. Target: TinyLlama 1.1B
 - [x] CUDA backend: 126 tok/s on RTX 3060 (28x over CPU), matches HF on all layers
 - [ ] Custom decode kernels (GEMV, fused attention)
 - [ ] INT8 / INT4 weight quantization
-- [ ] CUDA graphs
+- [x] CUDA graphs + fused QKV and gate/up: 145 tok/s (from 126)
 - [ ] Paged KV cache and continuous batching
 
 CPU baseline (Apple Silicon, naive scalar matvec): 4.3 tok/s.

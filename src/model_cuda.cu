@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -72,8 +73,11 @@ __device__ float block_max(float v) {
 }
 
 // ---------- kernels ----------
+// token and pos are read from device memory (state[0], state[1]) instead of being
+// kernel arguments. That way one recorded CUDA graph works for every token.
 
-__global__ void embed_kernel(float* out, const uint16_t* table, int token, int dim) {
+__global__ void embed_kernel(float* out, const uint16_t* table, const int* state, int dim) {
+    int token = state[0];
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < dim) out[i] = bf16_to_f32(table[size_t(token) * dim + i]);
 }
@@ -87,7 +91,7 @@ __global__ void rmsnorm_kernel(float* out, const float* x, const float* w, int n
     for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = x[i] * scale * w[i];
 }
 
-// One warp per output row. Naive on purpose: this is the kernel step 6 replaces.
+// One warp per output row.
 __global__ void matvec_bf16_kernel(float* out, const uint16_t* W, const float* x, int rows, int cols) {
     int lane = threadIdx.x & 31;
     int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -100,30 +104,50 @@ __global__ void matvec_bf16_kernel(float* out, const uint16_t* W, const float* x
     if (lane == 0) out[row] = sum;
 }
 
-// HF rotate_half layout: dim i pairs with i + head_dim/2
-__global__ void rope_kernel(float* vec, int n_heads, int head_dim, int pos, float theta) {
-    int half = head_dim / 2;
+// After the fused q|k|v matvec: apply RoPE to q (in place) and k, then write k and v
+// into the KV cache at the current position. HF rotate_half layout.
+// qkv layout: [q: n_heads*hd][k: n_kv*hd][v: n_kv*hd]
+__global__ void qkv_post_kernel(float* qkv, float* k_layer, float* v_layer, const int* state,
+                                int n_heads, int n_kv, int hd, float theta) {
+    int pos = state[1];
+    int half = hd / 2;
+    int q_dim = n_heads * hd;
+    int kv_dim = n_kv * hd;
+    int n_rot = (n_heads + n_kv) * half;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_heads * half) return;
 
-    int h = idx / half;
-    int i = idx % half;
-    float inv_freq = 1.0f / powf(theta, float(2 * i) / float(head_dim));
-    float angle = float(pos) * inv_freq;
-    float s, c;
-    sincosf(angle, &s, &c);
+    if (idx < n_rot) {
+        int h = idx / half; // q heads first, then k heads, they sit back to back
+        int i = idx % half;
+        float inv_freq = 1.0f / powf(theta, float(2 * i) / float(hd));
+        float s, c;
+        sincosf(float(pos) * inv_freq, &s, &c);
 
-    float* v = vec + h * head_dim;
-    float a = v[i];
-    float b = v[i + half];
-    v[i] = a * c - b * s;
-    v[i + half] = b * c + a * s;
+        float* v = qkv + h * hd;
+        float a = v[i];
+        float b = v[i + half];
+        float ra = a * c - b * s;
+        float rb = b * c + a * s;
+
+        if (h < n_heads) {
+            v[i] = ra;
+            v[i + half] = rb;
+        } else {
+            float* k = k_layer + size_t(pos) * kv_dim + (h - n_heads) * hd;
+            k[i] = ra;
+            k[i + half] = rb;
+        }
+    } else if (idx < n_rot + kv_dim) {
+        int j = idx - n_rot;
+        v_layer[size_t(pos) * kv_dim + j] = qkv[q_dim + kv_dim + j];
+    }
 }
 
 // One block per query head. Scores for every past position live in shared memory.
 __global__ void attention_kernel(float* out, const float* q, const float* k_cache, const float* v_cache,
-                                 int pos, int head_dim, int kv_dim, int group, float scale) {
-    extern __shared__ float sc[]; // pos + 1 floats
+                                 const int* state, int head_dim, int kv_dim, int group, float scale) {
+    extern __shared__ float sc[]; // sized for max_seq at launch
+    int pos = state[1];
 
     int h = blockIdx.x;
     int kvh = h / group;
@@ -156,11 +180,12 @@ __global__ void attention_kernel(float* out, const float* q, const float* k_cach
     }
 }
 
-__global__ void silu_mul_kernel(float* a, const float* b, int n) {
+// After the fused gate|up matvec: h[i] = silu(h[i]) * h[n + i], written into the first half.
+__global__ void silu_mul_kernel(float* h, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        float g = a[i];
-        a[i] = g / (1.0f + expf(-g)) * b[i];
+        float g = h[i];
+        h[i] = g / (1.0f + expf(-g)) * h[n + i];
     }
 }
 
@@ -181,12 +206,9 @@ struct CudaModel::Impl {
     struct Layer {
         float* attn_norm;
         float* mlp_norm;
-        uint16_t* wq;
-        uint16_t* wk;
-        uint16_t* wv;
+        uint16_t* wqkv; // [q_dim + 2*kv_dim, dim]
         uint16_t* wo;
-        uint16_t* gate;
-        uint16_t* up;
+        uint16_t* wgu; // [2*hidden, dim], gate rows then up rows
         uint16_t* down;
     };
 
@@ -198,11 +220,23 @@ struct CudaModel::Impl {
 
     float* k_cache = nullptr;
     float* v_cache = nullptr;
-    float *x, *xb, *q, *attn, *h1, *h2, *logits;
+    float *x, *xb, *qkv, *attn, *h, *logits;
+    int* state = nullptr;      // device: [token, pos]
+    int* host_state = nullptr; // pinned host copy
+    size_t attn_smem = 0;
+
+    cudaStream_t stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    bool use_graph = true;
 
     std::vector<float> host_tmp; // for taps
 
     ~Impl() {
+        if (graph_exec) cudaGraphExecDestroy(graph_exec);
+        if (graph) cudaGraphDestroy(graph);
+        if (stream) cudaStreamDestroy(stream);
+        if (host_state) cudaFreeHost(host_state);
         for (void* p : allocations) cudaFree(p);
     }
 
@@ -214,14 +248,23 @@ struct CudaModel::Impl {
         return static_cast<T*>(p);
     }
 
-    // Upload a BF16 matrix as-is and check its shape.
-    uint16_t* upload_bf16(const SafeTensors& st, const std::string& name, int64_t rows, int64_t cols) {
-        const Tensor& t = st.get(name);
-        if (t.dtype != DType::BF16) throw std::runtime_error(name + ": CUDA path only handles BF16 weights for now");
-        if (t.shape.size() != 2 || t.shape[0] != rows || t.shape[1] != cols)
-            throw std::runtime_error(name + ": unexpected shape");
-        uint16_t* d = alloc<uint16_t>(size_t(t.numel()));
-        CUDA_CHECK(cudaMemcpy(d, t.data, t.nbytes, cudaMemcpyHostToDevice));
+    // Upload one or more BF16 matrices stacked by rows into a single buffer.
+    uint16_t* upload_rows(const SafeTensors& st, const std::vector<std::string>& names,
+                          const std::vector<int64_t>& rows, int64_t cols) {
+        int64_t total = 0;
+        for (int64_t r : rows) total += r;
+        uint16_t* d = alloc<uint16_t>(size_t(total * cols));
+
+        int64_t offset = 0;
+        for (size_t i = 0; i < names.size(); ++i) {
+            const Tensor& t = st.get(names[i]);
+            if (t.dtype != DType::BF16)
+                throw std::runtime_error(names[i] + ": CUDA path only handles BF16 weights for now");
+            if (t.shape.size() != 2 || t.shape[0] != rows[i] || t.shape[1] != cols)
+                throw std::runtime_error(names[i] + ": unexpected shape");
+            CUDA_CHECK(cudaMemcpy(d + offset * cols, t.data, t.nbytes, cudaMemcpyHostToDevice));
+            offset += rows[i];
+        }
         return d;
     }
 
@@ -245,8 +288,8 @@ CudaModel::CudaModel(const std::string& model_dir, int max_seq)
     // the mmap only needs to live while we copy to the GPU
     SafeTensors st(model_dir + "/model.safetensors");
 
-    m.embed = m.upload_bf16(st, "model.embed_tokens.weight", c.vocab, c.dim);
-    m.lm_head = st.has("lm_head.weight") ? m.upload_bf16(st, "lm_head.weight", c.vocab, c.dim) : m.embed;
+    m.embed = m.upload_rows(st, {"model.embed_tokens.weight"}, {c.vocab}, c.dim);
+    m.lm_head = st.has("lm_head.weight") ? m.upload_rows(st, {"lm_head.weight"}, {c.vocab}, c.dim) : m.embed;
     m.final_norm = m.upload_f32(st, "model.norm.weight");
 
     for (int i = 0; i < c.n_layers; ++i) {
@@ -254,13 +297,14 @@ CudaModel::CudaModel(const std::string& model_dir, int max_seq)
         Impl::Layer l;
         l.attn_norm = m.upload_f32(st, p + "input_layernorm.weight");
         l.mlp_norm = m.upload_f32(st, p + "post_attention_layernorm.weight");
-        l.wq = m.upload_bf16(st, p + "self_attn.q_proj.weight", q_dim, c.dim);
-        l.wk = m.upload_bf16(st, p + "self_attn.k_proj.weight", kv_dim, c.dim);
-        l.wv = m.upload_bf16(st, p + "self_attn.v_proj.weight", kv_dim, c.dim);
-        l.wo = m.upload_bf16(st, p + "self_attn.o_proj.weight", c.dim, q_dim);
-        l.gate = m.upload_bf16(st, p + "mlp.gate_proj.weight", c.hidden_dim, c.dim);
-        l.up = m.upload_bf16(st, p + "mlp.up_proj.weight", c.hidden_dim, c.dim);
-        l.down = m.upload_bf16(st, p + "mlp.down_proj.weight", c.dim, c.hidden_dim);
+        l.wqkv = m.upload_rows(st,
+                               {p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
+                                p + "self_attn.v_proj.weight"},
+                               {q_dim, kv_dim, kv_dim}, c.dim);
+        l.wo = m.upload_rows(st, {p + "self_attn.o_proj.weight"}, {c.dim}, q_dim);
+        l.wgu = m.upload_rows(st, {p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"},
+                              {c.hidden_dim, c.hidden_dim}, c.dim);
+        l.down = m.upload_rows(st, {p + "mlp.down_proj.weight"}, {c.dim}, c.hidden_dim);
         m.layers.push_back(l);
     }
 
@@ -272,11 +316,21 @@ CudaModel::CudaModel(const std::string& model_dir, int max_seq)
 
     m.x = m.alloc<float>(c.dim);
     m.xb = m.alloc<float>(c.dim);
-    m.q = m.alloc<float>(q_dim);
+    m.qkv = m.alloc<float>(q_dim + 2 * kv_dim);
     m.attn = m.alloc<float>(q_dim);
-    m.h1 = m.alloc<float>(c.hidden_dim);
-    m.h2 = m.alloc<float>(c.hidden_dim);
+    m.h = m.alloc<float>(2 * c.hidden_dim);
     m.logits = m.alloc<float>(c.vocab);
+    m.state = m.alloc<int>(2);
+    CUDA_CHECK(cudaMallocHost(&m.host_state, 2 * sizeof(int)));
+
+    // attention scores need max_seq floats of shared memory; past 48KB we have to ask for it
+    m.attn_smem = size_t(max_seq_) * sizeof(float);
+    if (m.attn_smem > 48 * 1024)
+        CUDA_CHECK(cudaFuncSetAttribute(attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        int(m.attn_smem)));
+
+    CUDA_CHECK(cudaStreamCreate(&m.stream));
+    m.use_graph = std::getenv("ENGINE_NO_GRAPH") == nullptr;
 
     logits_.resize(c.vocab);
 }
@@ -290,18 +344,19 @@ std::string CudaModel::device_name() const {
     return prop.name;
 }
 
-const std::vector<float>& CudaModel::forward(int token, int pos, const Tap& tap) {
+// Queue every kernel for one token on the stream. With a tap, it also copies
+// checkpoints back for the golden check (that path can't be recorded into a graph).
+void CudaModel::enqueue(const Tap* tap) {
     const Config& c = cfg_;
     Impl& m = *impl_;
-    if (pos >= max_seq_) throw std::runtime_error("position past max_seq");
-    if (token < 0 || token >= c.vocab) throw std::runtime_error("token id out of range");
+    cudaStream_t s = m.stream;
 
-    // Only used by the golden check: copy a GPU buffer back and hand it to the tap.
     auto emit = [&](const std::string& name, const float* d, int n) {
-        if (!tap) return;
+        if (!tap || !*tap) return;
         m.host_tmp.resize(n);
-        CUDA_CHECK(cudaMemcpy(m.host_tmp.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost));
-        tap(name, m.host_tmp.data(), n);
+        CUDA_CHECK(cudaMemcpyAsync(m.host_tmp.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        (*tap)(name, m.host_tmp.data(), n);
     };
 
     const int T = 256;
@@ -311,60 +366,80 @@ const std::vector<float>& CudaModel::forward(int token, int pos, const Tap& tap)
     int kv_dim = c.n_kv_heads * hd;
     int group = c.n_heads / c.n_kv_heads;
     float scale = 1.0f / std::sqrt(float(hd));
+    int n_post = (c.n_heads + c.n_kv_heads) * hd / 2 + kv_dim;
 
     auto matvec = [&](float* out, const uint16_t* w, const float* x, int rows, int cols) {
         int warps_per_block = T / 32;
-        matvec_bf16_kernel<<<blocks_for(rows, warps_per_block), T>>>(out, w, x, rows, cols);
+        matvec_bf16_kernel<<<blocks_for(rows, warps_per_block), T, 0, s>>>(out, w, x, rows, cols);
     };
 
-    embed_kernel<<<blocks_for(dim, T), T>>>(m.x, m.embed, token, dim);
+    embed_kernel<<<blocks_for(dim, T), T, 0, s>>>(m.x, m.embed, m.state, dim);
     emit("embed", m.x, dim);
 
     for (int li = 0; li < c.n_layers; ++li) {
         const Impl::Layer& L = m.layers[li];
         std::string p = "layer" + std::to_string(li) + ".";
-
         float* k_layer = m.k_cache + size_t(li) * max_seq_ * kv_dim;
         float* v_layer = m.v_cache + size_t(li) * max_seq_ * kv_dim;
-        float* k = k_layer + size_t(pos) * kv_dim;
-        float* v = v_layer + size_t(pos) * kv_dim;
 
-        rmsnorm_kernel<<<1, 1024>>>(m.xb, m.x, L.attn_norm, dim, c.norm_eps);
+        rmsnorm_kernel<<<1, 1024, 0, s>>>(m.xb, m.x, L.attn_norm, dim, c.norm_eps);
         emit(p + "attn_norm", m.xb, dim);
 
-        matvec(m.q, L.wq, m.xb, q_dim, dim);
-        matvec(k, L.wk, m.xb, kv_dim, dim);
-        matvec(v, L.wv, m.xb, kv_dim, dim);
-
-        rope_kernel<<<blocks_for(c.n_heads * hd / 2, T), T>>>(m.q, c.n_heads, hd, pos, c.rope_theta);
-        rope_kernel<<<blocks_for(c.n_kv_heads * hd / 2, T), T>>>(k, c.n_kv_heads, hd, pos, c.rope_theta);
-
-        size_t smem = size_t(pos + 1) * sizeof(float);
-        attention_kernel<<<c.n_heads, 128, smem>>>(m.attn, m.q, k_layer, v_layer, pos, hd, kv_dim, group, scale);
+        matvec(m.qkv, L.wqkv, m.xb, q_dim + 2 * kv_dim, dim);
+        qkv_post_kernel<<<blocks_for(n_post, T), T, 0, s>>>(m.qkv, k_layer, v_layer, m.state, c.n_heads,
+                                                            c.n_kv_heads, hd, c.rope_theta);
+        attention_kernel<<<c.n_heads, 128, m.attn_smem, s>>>(m.attn, m.qkv, k_layer, v_layer, m.state, hd,
+                                                             kv_dim, group, scale);
 
         matvec(m.xb, L.wo, m.attn, dim, q_dim);
         emit(p + "attn_out", m.xb, dim);
-        add_kernel<<<blocks_for(dim, T), T>>>(m.x, m.xb, dim);
+        add_kernel<<<blocks_for(dim, T), T, 0, s>>>(m.x, m.xb, dim);
 
-        rmsnorm_kernel<<<1, 1024>>>(m.xb, m.x, L.mlp_norm, dim, c.norm_eps);
+        rmsnorm_kernel<<<1, 1024, 0, s>>>(m.xb, m.x, L.mlp_norm, dim, c.norm_eps);
         emit(p + "mlp_norm", m.xb, dim);
 
-        matvec(m.h1, L.gate, m.xb, c.hidden_dim, dim);
-        matvec(m.h2, L.up, m.xb, c.hidden_dim, dim);
-        silu_mul_kernel<<<blocks_for(c.hidden_dim, T), T>>>(m.h1, m.h2, c.hidden_dim);
-        matvec(m.xb, L.down, m.h1, dim, c.hidden_dim);
+        matvec(m.h, L.wgu, m.xb, 2 * c.hidden_dim, dim);
+        silu_mul_kernel<<<blocks_for(c.hidden_dim, T), T, 0, s>>>(m.h, c.hidden_dim);
+        matvec(m.xb, L.down, m.h, dim, c.hidden_dim);
         emit(p + "mlp_out", m.xb, dim);
-        add_kernel<<<blocks_for(dim, T), T>>>(m.x, m.xb, dim);
+        add_kernel<<<blocks_for(dim, T), T, 0, s>>>(m.x, m.xb, dim);
 
         emit(p + "out", m.x, dim);
     }
 
-    rmsnorm_kernel<<<1, 1024>>>(m.xb, m.x, m.final_norm, dim, c.norm_eps);
+    rmsnorm_kernel<<<1, 1024, 0, s>>>(m.xb, m.x, m.final_norm, dim, c.norm_eps);
     emit("final_norm", m.xb, dim);
 
     matvec(m.logits, m.lm_head, m.xb, c.vocab, dim);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemcpy(logits_.data(), m.logits, c.vocab * sizeof(float), cudaMemcpyDeviceToHost));
     emit("logits", m.logits, c.vocab);
+}
+
+const std::vector<float>& CudaModel::forward(int token, int pos, const Tap& tap) {
+    const Config& c = cfg_;
+    Impl& m = *impl_;
+    if (pos >= max_seq_) throw std::runtime_error("position past max_seq");
+    if (token < 0 || token >= c.vocab) throw std::runtime_error("token id out of range");
+
+    m.host_state[0] = token;
+    m.host_state[1] = pos;
+    CUDA_CHECK(cudaMemcpyAsync(m.state, m.host_state, 2 * sizeof(int), cudaMemcpyHostToDevice, m.stream));
+
+    if (tap || !m.use_graph) {
+        enqueue(tap ? &tap : nullptr);
+    } else {
+        if (!m.graph_exec) {
+            // record the whole token once, then replay it every call
+            CUDA_CHECK(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeThreadLocal));
+            enqueue(nullptr);
+            CUDA_CHECK(cudaStreamEndCapture(m.stream, &m.graph));
+            CUDA_CHECK(cudaGraphInstantiate(&m.graph_exec, m.graph, 0));
+        }
+        CUDA_CHECK(cudaGraphLaunch(m.graph_exec, m.stream));
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(logits_.data(), m.logits, c.vocab * sizeof(float), cudaMemcpyDeviceToHost,
+                               m.stream));
+    CUDA_CHECK(cudaStreamSynchronize(m.stream));
     return logits_;
 }

@@ -21,6 +21,7 @@ public:
 
 private:
     struct Impl;
+    void enqueue(const Tap* tap);
     Config cfg_;
     int max_seq_;
     std::unique_ptr<Impl> impl_;
