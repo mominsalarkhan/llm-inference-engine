@@ -1,7 +1,10 @@
 #include "safetensors.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 
 #include <fcntl.h>
@@ -328,4 +331,44 @@ std::vector<float> to_f32(const Tensor& t) {
     std::vector<float> out(size_t(t.numel()));
     to_f32(t, 0, out.size(), out.data());
     return out;
+}
+
+WeightFiles::WeightFiles(const std::string& model_dir) {
+    std::vector<std::string> names;
+
+    std::ifstream idx(model_dir + "/model.safetensors.index.json");
+    if (idx) {
+        // every shard name appears as a "....safetensors" string in the weight map
+        std::stringstream ss;
+        ss << idx.rdbuf();
+        std::string text = ss.str();
+        const std::string ext = ".safetensors\"";
+        size_t at = 0;
+        while ((at = text.find(ext, at)) != std::string::npos) {
+            size_t start = text.rfind('"', at);
+            std::string file = text.substr(start + 1, at + ext.size() - 2 - start);
+            if (file.find('/') == std::string::npos &&
+                std::find(names.begin(), names.end(), file) == names.end())
+                names.push_back(file);
+            at += ext.size();
+        }
+        if (names.empty()) fail("no shard names in " + model_dir + "/model.safetensors.index.json");
+    } else {
+        names.push_back("model.safetensors");
+    }
+
+    for (const auto& n : names) {
+        files_.push_back(std::make_unique<SafeTensors>(model_dir + "/" + n));
+        for (const auto& kv : files_.back()->tensors()) index_[kv.first] = &kv.second;
+    }
+}
+
+bool WeightFiles::has(const std::string& name) const {
+    return index_.count(name) > 0;
+}
+
+const Tensor& WeightFiles::get(const std::string& name) const {
+    auto it = index_.find(name);
+    if (it == index_.end()) fail("no tensor named " + name);
+    return *it->second;
 }

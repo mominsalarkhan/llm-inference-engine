@@ -38,7 +38,7 @@ int require_int(const std::string& text, const std::string& key) {
     return int(v);
 }
 
-std::vector<float> load_vec(const SafeTensors& st, const std::string& name) {
+std::vector<float> load_vec(const WeightFiles& st, const std::string& name) {
     return to_f32(st.get(name));
 }
 
@@ -63,7 +63,7 @@ Config load_config(const std::string& path) {
 
 Model::Model(const std::string& model_dir, int max_seq)
     : cfg_(load_config(model_dir + "/config.json")),
-      weights_(model_dir + "/model.safetensors"),
+      weights_(model_dir),
       max_seq_(max_seq) {
     const Config& c = cfg_;
 

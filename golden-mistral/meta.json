@@ -1,0 +1,4 @@
+{
+  "model": "models/mistral-7b",
+  "ppl_tokens": 456
+}

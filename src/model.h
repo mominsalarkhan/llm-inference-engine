@@ -49,7 +49,7 @@ private:
     };
 
     Config cfg_;
-    SafeTensors weights_;
+    WeightFiles weights_;
     int max_seq_;
 
     const Tensor* embed_;

@@ -12,7 +12,8 @@
 //   Q8:   int8 per weight + one fp32 scale per 128 weights (~1.03 bytes per weight)
 //   Q4:   4 bits per weight + fp16 (scale, min) per 64 weights (~0.56 bytes per weight),
 //         output layer kept at Q8
-enum class Quant { BF16, Q8, Q4 };
+//   Q4_MSE: same format, but each group's (scale, min) is searched to minimize squared error
+enum class Quant { BF16, Q8, Q4, Q4_MSE };
 
 // Same interface as Model, but weights, KV cache and all the math live on the GPU.
 // This header stays plain C++ so main.cpp doesn't need nvcc.

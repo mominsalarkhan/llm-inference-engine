@@ -338,7 +338,7 @@ struct CudaModel::Impl {
     }
 
     // Stack one or more BF16 matrices by rows into a single GPU matrix, quantizing on the way if asked.
-    Mat upload(const SafeTensors& st, const std::vector<std::string>& names, const std::vector<int64_t>& rows,
+    Mat upload(const WeightFiles& st, const std::vector<std::string>& names, const std::vector<int64_t>& rows,
                int64_t cols, Quant fmt) {
         Mat m;
         for (int64_t r : rows) m.rows += int(r);
@@ -430,7 +430,11 @@ struct CudaModel::Impl {
         std::vector<uint8_t> hq(size_t(m.rows) * cols / 2);
         std::vector<__half2> hsm(size_t(m.rows) * groups);
 
+        bool search = fmt == Quant::Q4_MSE;
+
         for_each_row([&](int64_t r, const float* row) {
+            int q[Q4_GROUP];
+            int trial[Q4_GROUP];
             for (int g = 0; g < groups; ++g) {
                 const float* w = row + g * Q4_GROUP;
                 float lo = w[0];
@@ -439,20 +443,69 @@ struct CudaModel::Impl {
                     lo = std::min(lo, w[k]);
                     hi = std::max(hi, w[k]);
                 }
-                __half h_scale = __float2half((hi - lo) / 15.0f);
-                __half h_min = __float2half(lo);
-                float scale = __half2float(h_scale);
-                float mn = __half2float(h_min);
-                float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
 
-                uint8_t* q = hq.data() + (size_t(r) * cols + g * Q4_GROUP) / 2;
-                for (int k = 0; k < Q4_GROUP; k += 2) {
-                    int a = int(std::nearbyint((w[k] - mn) * inv));
-                    int b = int(std::nearbyint((w[k + 1] - mn) * inv));
-                    a = std::max(0, std::min(15, a));
-                    b = std::max(0, std::min(15, b));
-                    q[k / 2] = uint8_t(a | (b << 4));
+                auto assign = [&](float sc, float mn, int* out) {
+                    float inv = sc > 0.0f ? 1.0f / sc : 0.0f;
+                    for (int k = 0; k < Q4_GROUP; ++k)
+                        out[k] = std::max(0, std::min(15, int(std::nearbyint((w[k] - mn) * inv))));
+                };
+                auto sq_error = [&](float sc, float mn, const int* qq) {
+                    float e = 0.0f;
+                    for (int k = 0; k < Q4_GROUP; ++k) {
+                        float d = qq[k] * sc + mn - w[k];
+                        e += d * d;
+                    }
+                    return e;
+                };
+
+                // plain round-to-nearest: min..max mapped onto 0..15
+                float scale = (hi - lo) / 15.0f;
+                float mn = lo;
+
+                if (search) {
+                    // Try ranges shrunk by 0..16%, then refit scale and min by least squares on the
+                    // chosen levels (fit w ~ q*scale + min), reassign, refit once more. Keep the best.
+                    float best = INFINITY;
+                    for (int step = 0; step <= 8; ++step) {
+                        float shrink = 0.02f * step;
+                        float s_try = (hi - lo) * (1.0f - shrink) / 15.0f;
+                        float m_try = lo + (hi - lo) * shrink * 0.5f;
+                        assign(s_try, m_try, trial);
+
+                        for (int iter = 0; iter < 2; ++iter) {
+                            float n = float(Q4_GROUP), sq = 0, sqq = 0, sw = 0, sqw = 0;
+                            for (int k = 0; k < Q4_GROUP; ++k) {
+                                sq += trial[k];
+                                sqq += float(trial[k]) * trial[k];
+                                sw += w[k];
+                                sqw += trial[k] * w[k];
+                            }
+                            float det = n * sqq - sq * sq;
+                            if (det <= 0.0f) break;
+                            float s_fit = (n * sqw - sq * sw) / det;
+                            if (s_fit <= 0.0f) break;
+                            s_try = s_fit;
+                            m_try = (sw - s_fit * sq) / n;
+                            assign(s_try, m_try, trial);
+                        }
+
+                        float e = sq_error(s_try, m_try, trial);
+                        if (e < best) {
+                            best = e;
+                            scale = s_try;
+                            mn = m_try;
+                        }
+                    }
                 }
+
+                // store as fp16 and quantize with the rounded values, so the GPU sees exactly this
+                __half h_scale = __float2half(scale);
+                __half h_min = __float2half(mn);
+                assign(__half2float(h_scale), __half2float(h_min), q);
+
+                uint8_t* out = hq.data() + (size_t(r) * cols + g * Q4_GROUP) / 2;
+                for (int k = 0; k < Q4_GROUP; k += 2) out[k / 2] = uint8_t(q[k] | (q[k + 1] << 4));
+
                 __half2 packed_sm;
                 packed_sm.x = h_scale;
                 packed_sm.y = h_min;
@@ -469,7 +522,7 @@ struct CudaModel::Impl {
     }
 
     // Norm weights are tiny, convert to fp32 on the host first.
-    float* upload_f32(const SafeTensors& st, const std::string& name) {
+    float* upload_f32(const WeightFiles& st, const std::string& name) {
         std::vector<float> v = to_f32(st.get(name));
         float* d = alloc<float>(v.size());
         CUDA_CHECK(cudaMemcpy(d, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice));
@@ -487,12 +540,12 @@ CudaModel::CudaModel(const std::string& model_dir, int max_seq, Quant quant)
     int kv_dim = c.n_kv_heads * c.head_dim;
 
     // the mmap only needs to live while we copy to the GPU
-    SafeTensors st(model_dir + "/model.safetensors");
+    WeightFiles st(model_dir);
 
     m.embed = m.upload(st, {"model.embed_tokens.weight"}, {c.vocab}, c.dim, Quant::BF16).bf16;
     std::string head = st.has("lm_head.weight") ? "lm_head.weight" : "model.embed_tokens.weight";
     // the output layer picks the next word, so in 4-bit mode it stays 8-bit
-    m.lm_head = m.upload(st, {head}, {c.vocab}, c.dim, quant == Quant::Q4 ? Quant::Q8 : quant);
+    m.lm_head = m.upload(st, {head}, {c.vocab}, c.dim, (quant == Quant::Q4 || quant == Quant::Q4_MSE) ? Quant::Q8 : quant);
     m.final_norm = m.upload_f32(st, "model.norm.weight");
 
     for (int i = 0; i < c.n_layers; ++i) {

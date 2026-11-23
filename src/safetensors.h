@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -39,6 +40,21 @@ private:
     void* map_ = nullptr;
     size_t size_ = 0;
     std::unordered_map<std::string, Tensor> tensors_;
+};
+
+// All weight files of one model folder: model.safetensors, or the shards listed in
+// model.safetensors.index.json (bigger models ship split into several files).
+class WeightFiles {
+public:
+    explicit WeightFiles(const std::string& model_dir);
+
+    bool has(const std::string& name) const;
+    const Tensor& get(const std::string& name) const;
+    size_t file_count() const { return files_.size(); }
+
+private:
+    std::vector<std::unique_ptr<SafeTensors>> files_;
+    std::unordered_map<std::string, const Tensor*> index_;
 };
 
 // Convert count elements starting at element `start` into float.

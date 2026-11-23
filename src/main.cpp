@@ -234,6 +234,7 @@ int with_model(const std::string& backend, const std::string& model_dir, int max
     if (backend == "cuda") q = Quant::BF16;
     else if (backend == "cuda-q8") q = Quant::Q8;
     else if (backend == "cuda-q4") q = Quant::Q4;
+    else if (backend == "cuda-q4mse") q = Quant::Q4_MSE;
     else known = false;
     if (known) {
         auto t0 = std::chrono::steady_clock::now();
@@ -244,7 +245,7 @@ int with_model(const std::string& backend, const std::string& model_dir, int max
         return fn(model);
     }
 #endif
-    std::printf("unknown or unavailable backend: %s (try cpu, cuda, cuda-q8, cuda-q4)\n", backend.c_str());
+    std::printf("unknown or unavailable backend: %s (try cpu, cuda, cuda-q8, cuda-q4, cuda-q4mse)\n", backend.c_str());
     return 1;
 }
 
@@ -268,7 +269,11 @@ int check(const std::string& model_dir, const std::string& golden_dir, const std
 int bench(const std::string& model_dir, const std::string& backend, int n) {
     return with_model(backend, model_dir, n + 2, [&](auto& model) {
         int tok = 1; // BOS
-        model.forward(tok, 0); // warm up
+        // Warm up for a full second first. An idle GPU sits at low clocks and needs a moment
+        // to ramp up; without this, short runs measure the ramp instead of the engine.
+        auto w0 = std::chrono::steady_clock::now();
+        while (std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count() < 1.0)
+            model.forward(tok, 0);
         auto t0 = std::chrono::steady_clock::now();
         for (int pos = 1; pos <= n; ++pos) tok = argmax(model.forward(tok, pos));
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -320,6 +325,34 @@ int ppl(const std::string& model_dir, const std::string& golden_dir, const std::
     });
 }
 
+// Greedy generation from given prompt token ids. Prints the new ids on one line so a
+// script (tools/run.py) can decode them, then a timing line.
+int generate(const std::string& model_dir, const std::string& backend, int n, const std::vector<int>& prompt) {
+    if (prompt.empty()) throw std::runtime_error("generate needs at least one prompt token id");
+    return with_model(backend, model_dir, int(prompt.size()) + n + 1, [&](auto& model) {
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<float> logits;
+        for (size_t i = 0; i < prompt.size(); ++i) logits = model.forward(prompt[i], int(i));
+        double prefill = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+        std::vector<int> out;
+        int tok = argmax(logits);
+        t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < n; ++i) {
+            out.push_back(tok);
+            if (tok == 2 || i + 1 == n) break; // 2 = end of sequence for Llama-family tokenizers
+            tok = argmax(model.forward(tok, int(prompt.size()) + i));
+        }
+        double gen = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+        std::printf("ids:");
+        for (int t : out) std::printf(" %d", t);
+        std::printf("\nprompt %zu tokens in %.2fs, generated %zu tokens at %.1f tok/s\n", prompt.size(), prefill,
+                    out.size(), out.size() > 1 ? (out.size() - 1) / gen : 0.0);
+        return 0;
+    });
+}
+
 void usage() {
     std::printf("usage:\n");
     std::printf("  engine inspect <file.safetensors>\n");
@@ -327,7 +360,8 @@ void usage() {
     std::printf("  engine check <model_dir> <golden_dir> <prompt> [backend]\n");
     std::printf("  engine bench <model_dir> [backend] [tokens]\n");
     std::printf("  engine ppl <model_dir> <golden_dir> [backend]\n");
-    std::printf("backends: cpu, cuda, cuda-q8, cuda-q4\n");
+    std::printf("  engine generate <model_dir> <backend> <n_tokens> <prompt ids...>\n");
+    std::printf("backends: cpu, cuda, cuda-q8, cuda-q4, cuda-q4mse\n");
 }
 
 } // namespace
@@ -347,6 +381,11 @@ int main(int argc, char** argv) {
         if (cmd == "bench" && argc >= 3 && argc <= 5)
             return bench(argv[2], argc >= 4 ? argv[3] : "cpu", argc == 5 ? std::atoi(argv[4]) : 128);
         if (cmd == "ppl" && (argc == 4 || argc == 5)) return ppl(argv[2], argv[3], argc == 5 ? argv[4] : "cpu");
+        if (cmd == "generate" && argc >= 6) {
+            std::vector<int> prompt;
+            for (int i = 5; i < argc; ++i) prompt.push_back(std::atoi(argv[i]));
+            return generate(argv[2], argv[3], std::atoi(argv[4]), prompt);
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;
